@@ -132,7 +132,9 @@ public:
   // 等待对端 write_with_imm 到 last_local_mr_，返回是否收到 imm
   bool wait_write_imm() {
     auto t = [&]() -> rdmapp::task<void> {
+      fprintf(stderr, "[Server] waiting write_with_imm on MR len=%zu\n", last_local_mr_->length());
       auto p = co_await qp_->recv(last_local_mr_);
+      fprintf(stderr, "[Server] wait_write_imm done, imm=%s\n", p.second.has_value() ? "yes":"no");
       has_imm_ = p.second.has_value();
       co_return;
     }();
@@ -184,7 +186,9 @@ public:
   void recv_remote_mr_meta() {
     char meta[rdmapp::remote_mr::kSerializedSize];
     auto t = [&]() -> rdmapp::task<void> {
+      fprintf(stderr, "[Client] post_recv_remote_mr %zu\n", sizeof(meta));
       co_await qp_->recv(meta, sizeof(meta));
+      fprintf(stderr, "[Client] recv_remote_mr done\n");
       co_return;
     }();
     t.get_future().get();

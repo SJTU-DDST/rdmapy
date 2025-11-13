@@ -8,6 +8,7 @@ print("ready to recv")
 msg = cli.recv_bytes(5)          # 收服务端的 hello
 print("[client] recv:", msg)
 
+print("ready to send")
 cli.send_bytes(b"world")         # 回 world
 print("[client] sent: world")
 

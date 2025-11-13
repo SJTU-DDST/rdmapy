@@ -17,10 +17,11 @@ PYBIND11_MODULE(rdma_py, m) {
     .def("accept_once", &Server::accept_once)
     .def("send_bytes",  &Server::send_bytes)
     .def("recv_bytes",  &Server::recv_bytes)
-    .def("expose_buffer_as_mr", [](Server& s, py::bytes pybuf){
-        // 把 Python bytes 拷到一块持久缓冲（示例：直接 std::string 持有）
-        std::string* holder = new std::string(pybuf); // 简单做法：泄漏到进程结束；可改成共享管理
-        return s.expose_buffer_as_mr(holder->data(), holder->size());
+    .def("expose_buffer_as_mr", [](Server& s, py::bytes pybuf) {
+        // 把 Python bytes 拷到一块持久缓冲
+        std::string holder = pybuf;
+        std::string meta = s.expose_buffer_as_mr(holder.data(), holder.size());
+        return py::bytes(meta);  // ✅ 用 py::bytes 包装返回值，防止 UTF-8 解码
     })
     .def("wait_write_imm", &Server::wait_write_imm)
     .def("wait_atomic_done", &Server::wait_atomic_done);
