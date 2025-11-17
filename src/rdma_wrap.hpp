@@ -14,36 +14,44 @@
 namespace pywrap {
 
 class Session {
-public:
-  Session(int dev_index=0, int port=1) {
-    device_ = std::make_shared<rdmapp::device>(dev_index, port);
-    pd_     = std::make_shared<rdmapp::pd>(device_);
-    cq_     = std::make_shared<rdmapp::cq>(device_);
-
-    poller_ = std::make_shared<rdmapp::cq_poller>(cq_);
-
-    // ✅ 再建 loop，并启动
-    loop_   = rdmapp::socket::event_loop::new_loop();
-    looper_ = std::thread([this]{ loop_->loop(); });
-  }
-
-  ~Session() {
-    if (loop_) loop_->close();
-    if (looper_.joinable()) looper_.join();
-  }
-
-  std::shared_ptr<rdmapp::pd> pd() const { return pd_; }
-  std::shared_ptr<rdmapp::cq> cq() const { return cq_; }
-  std::shared_ptr<rdmapp::socket::event_loop> loop() const { return loop_; }
-
-private:
-  std::shared_ptr<rdmapp::device> device_;
-  std::shared_ptr<rdmapp::pd> pd_;
-  std::shared_ptr<rdmapp::cq> cq_;
-  std::shared_ptr<rdmapp::cq_poller> poller_;
-  std::shared_ptr<rdmapp::socket::event_loop> loop_;
-  std::thread looper_;
+  public:
+    Session(int dev_index=0, int port=1)
+    {
+      // 1. 设备 / PD / CQ
+      device_ = std::make_shared<rdmapp::device>(dev_index, port);
+      pd_     = std::make_shared<rdmapp::pd>(device_);
+      cq_     = std::make_shared<rdmapp::cq>(device_);
+  
+      // 2. 完全照官方示例：先 cq_poller，再 event_loop
+      //    main 里就是：
+      //      auto cq_poller = std::make_shared<rdmapp::cq_poller>(cq);
+      //      auto loop = event_loop::new_loop();
+      //      std::thread([loop]{ loop->loop(); });
+      poller_ = std::make_shared<rdmapp::cq_poller>(cq_);
+  
+      loop_   = rdmapp::socket::event_loop::new_loop();
+      looper_ = std::thread([this]{ loop_->loop(); });
+    }
+  
+    ~Session() {
+      if (loop_) loop_->close();
+      if (looper_.joinable()) looper_.join();
+    }
+  
+    std::shared_ptr<rdmapp::pd> pd()   const { return pd_; }
+    std::shared_ptr<rdmapp::cq> cq()   const { return cq_; }
+    std::shared_ptr<rdmapp::socket::event_loop> loop() const { return loop_; }
+  
+  private:
+    std::shared_ptr<rdmapp::device> device_;
+    std::shared_ptr<rdmapp::pd>     pd_;
+    std::shared_ptr<rdmapp::cq>     cq_;
+    std::shared_ptr<rdmapp::cq_poller> poller_;  // 只要“存在”即可
+  
+    std::shared_ptr<rdmapp::socket::event_loop> loop_;
+    std::thread looper_;
 };
+    
 
 class Endpoint {
 public:
@@ -69,11 +77,16 @@ public:
     size_t got = 0;
     auto t = [this, out, need, &got]() -> rdmapp::task<void> {
       fprintf(stderr, "[recv_bytes] post_recv %zu\n", need);
-      while (got < need) {
-        auto [n, imm] = co_await qp_->recv(out->data() + got, need - got);
-        got += n;
-        fprintf(stderr, "[recv_bytes] chunk n=%zu total=%zu imm=%s\n",
-                n, got, imm ? "yes" : "no");
+      try {
+        while (got < need) {
+          auto [n, imm] = co_await qp_->recv(out->data() + got, need - got);
+          got += n;
+          fprintf(stderr, "[recv_bytes] chunk n=%zu total=%zu imm=%s\n",
+                  n, got, imm ? "yes" : "no");
+        }
+      } catch (const std::exception& e) {
+        fprintf(stderr, "[recv_bytes] exception: %s\n", e.what());
+        throw;
       }
       co_return;
     }();
@@ -98,16 +111,17 @@ public:
     //   sess_->loop(), port, sess_->pd(), sess_->cq(), srq);
     // acceptor_ = std::make_unique<rdmapp::acceptor>(sess_->loop(), port, sess_->pd(), sess_->cq());
     // 如果将来想用 SRQ，这里可改为 new rdmapp::srq(sess_->pd())
-    std::shared_ptr<rdmapp::srq> srq = nullptr;
+    // std::shared_ptr<rdmapp::srq> srq = nullptr;
 
-    if (srq) {
-      acceptor_ = std::make_unique<rdmapp::acceptor>(
-          sess_->loop(), port, sess_->pd(), sess_->cq(), srq);
-    } else {
-      // ✅ 默认走不带 SRQ 的安全构造
-      acceptor_ = std::make_unique<rdmapp::acceptor>(
-          sess_->loop(), port, sess_->pd(), sess_->cq());
-    }
+    // if (srq) {
+    //   acceptor_ = std::make_unique<rdmapp::acceptor>(
+    //       sess_->loop(), port, sess_->pd(), sess_->cq(), srq);
+    // } else {
+    //   // ✅ 默认走不带 SRQ 的安全构造
+    //   acceptor_ = std::make_unique<rdmapp::acceptor>(
+    //       sess_->loop(), port, sess_->pd(), sess_->cq());
+    // }
+    acceptor_ = std::make_unique<rdmapp::acceptor>( sess_->loop(), port, sess_->pd(), sess_->cq());
   }
 
   // 阻塞接受一次，返回后持有一个 QP
@@ -164,16 +178,17 @@ public:
     //   qp_ = co_await connector_->connect();
     //   co_return;
     // }();
-    std::shared_ptr<rdmapp::srq> srq = nullptr;
+    // std::shared_ptr<rdmapp::srq> srq = nullptr;
 
-    if (srq) {
-      connector_ = std::make_unique<rdmapp::connector>(
-          sess_->loop(), host, port, sess_->pd(), sess_->cq(), srq);
-    } else {
-      // ✅ 安全构造
-      connector_ = std::make_unique<rdmapp::connector>(
-          sess_->loop(), host, port, sess_->pd(), sess_->cq());
-    }
+    // if (srq) {
+    //   connector_ = std::make_unique<rdmapp::connector>(
+    //       sess_->loop(), host, port, sess_->pd(), sess_->cq(), srq);
+    // } else {
+    //   // ✅ 安全构造
+    //   connector_ = std::make_unique<rdmapp::connector>(
+    //       sess_->loop(), host, port, sess_->pd(), sess_->cq());
+    // }
+    connector_ = std::make_unique<rdmapp::connector>( sess_->loop(), host, port, sess_->pd(), sess_->cq());
 
     auto t = [&]() -> rdmapp::task<void> {
       qp_ = co_await connector_->connect();
