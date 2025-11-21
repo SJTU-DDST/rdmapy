@@ -18,6 +18,7 @@
 // 为了让 QP 和缓冲区不被析构，简单放到全局容器里
 static std::vector<std::shared_ptr<rdmapp::qp>> g_qps;
 static std::vector<std::shared_ptr<std::vector<std::uint8_t>>> g_buffers;
+static std::vector<std::shared_ptr<rdmapp::local_mr>> g_mrs;
 
 constexpr std::size_t KV_BUFFER_SIZE = 1ull << 20; // 1 MB
 
@@ -41,7 +42,8 @@ asio::awaitable<void> handle_qp(std::shared_ptr<rdmapp::qp> qp) {
   // 3. 把资源挂到全局，保证它们的生命周期 >= Python 读写
   g_qps.push_back(qp);
   g_buffers.push_back(kv_buf);
-
+  g_mrs.push_back(local_mr);
+  
   co_return;
 }
 
