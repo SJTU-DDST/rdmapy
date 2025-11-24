@@ -20,7 +20,7 @@ static std::vector<std::shared_ptr<rdmapp::qp>> g_qps;
 static std::vector<std::shared_ptr<std::vector<std::uint8_t>>> g_buffers;
 static std::vector<std::shared_ptr<rdmapp::local_mr>> g_mrs;
 
-constexpr std::size_t KV_BUFFER_SIZE = 1ull << 20; // 1 MB
+constexpr std::size_t KV_BUFFER_SIZE = 8ull << 30;
 
 asio::awaitable<void> handle_qp(std::shared_ptr<rdmapp::qp> qp) {
   spdlog::info("handling qp (KV server)");

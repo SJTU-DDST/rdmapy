@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # 查找并杀掉 client.py 和 server.py 进程
-for script in client_mr_test.py server_mr_test.py client.py server.py; do
-    PIDS=$(ps -ef | grep "examples/$script" | grep -v "grep" | awk '{print $2}')
+for script in client_mr_test.py server_mr_test.py client.py server.py run_baseline.sh test_rw.py; do
+    PIDS=$(ps -ef | grep "$script" | grep -v "grep" | awk '{print $2}')
     if [ -z "$PIDS" ]; then
         echo "$script 未运行"
     else
