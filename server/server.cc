@@ -20,32 +20,48 @@ static std::vector<std::shared_ptr<rdmapp::qp>> g_qps;
 static std::vector<std::shared_ptr<std::vector<std::uint8_t>>> g_buffers;
 static std::vector<std::shared_ptr<rdmapp::local_mr>> g_mrs;
 
-constexpr std::size_t KV_BUFFER_SIZE = 8ull << 30;
+constexpr std::size_t KV_BUFFER_SIZE = 2ull << 30;
 
 asio::awaitable<void> handle_qp(std::shared_ptr<rdmapp::qp> qp) {
-  spdlog::info("handling qp (KV server)");
+    spdlog::info("handling qp (KV server)");
 
-  // 1. 为这个 QP 分配 KV buffer，并注册 MR
-  auto kv_buf =
-      std::make_shared<std::vector<std::uint8_t>>(KV_BUFFER_SIZE);
-  auto local_mr = std::make_shared<rdmapp::local_mr>(
-      qp->pd_ptr()->reg_mr(kv_buf->data(), kv_buf->size()));
+    const int NUM_CHUNKS = 8;      // 2GB x 8 = 16GB
+    const size_t CHUNK_SIZE = 2ull << 30;
 
-  // 2. 序列化这个 MR，send 给客户端
-  auto serialized = local_mr->serialize();
-  auto bytes = std::as_bytes(std::span(serialized));
-  co_await qp->send(bytes);
+    // 发送总 MR 数量（占 4 字节）
+    {
+        uint32_t n = NUM_CHUNKS;
+        co_await qp->send(std::as_bytes(std::span(&n, 1)));
+    }
 
-  spdlog::info("sent MR to client: addr={} length={} rkey={}",
-               local_mr->addr(), local_mr->length(), local_mr->rkey());
+    for (int i = 0; i < NUM_CHUNKS; i++) {
 
-  // 3. 把资源挂到全局，保证它们的生命周期 >= Python 读写
-  g_qps.push_back(qp);
-  g_buffers.push_back(kv_buf);
-  g_mrs.push_back(local_mr);
-  
-  co_return;
+        auto kv_buf = std::make_shared<std::vector<uint8_t>>(CHUNK_SIZE);
+        auto local_mr = std::make_shared<rdmapp::local_mr>(
+            qp->pd_ptr()->reg_mr(kv_buf->data(), kv_buf->size()));
+
+        auto serialized = local_mr->serialize();
+        co_await qp->send(std::as_bytes(std::span(serialized)));
+
+        spdlog::info(
+            "MR[{}]: addr={:p} length={} rkey={}",
+            i,
+            static_cast<void*>(local_mr->addr()),
+            local_mr->length(),
+            local_mr->rkey()
+        );
+
+
+        // 保存引用避免 buffer 提前 free
+        g_buffers.push_back(kv_buf);
+        g_mrs.push_back(local_mr);
+    }
+
+    g_qps.push_back(qp);
+
+    co_return;
 }
+
 
 asio::awaitable<void> server(std::shared_ptr<rdmapp::qp_acceptor> acceptor) {
   while (true) {
