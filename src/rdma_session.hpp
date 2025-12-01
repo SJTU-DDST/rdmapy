@@ -122,7 +122,7 @@ private:
 class RdmaEndpoint {
 public:
     explicit RdmaEndpoint(int ib_port = 1) {
-        device_ = std::make_shared<rdmapp::device>(0, ib_port);
+        device_ = std::make_shared<rdmapp::device>(1, ib_port);
         pd_     = std::make_shared<rdmapp::pd>(device_);
         cq_     = std::make_shared<rdmapp::cq>(device_);
 
