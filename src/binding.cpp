@@ -16,8 +16,8 @@ PYBIND11_MODULE(rdma_py, m) {
     py::class_<RdmaSession, std::shared_ptr<RdmaSession>>(m, "Session")
         .def("read",
              [](RdmaSession &sess,
-                std::uint32_t offset,
-                std::uint32_t length) {
+                std::uint64_t offset,
+                std::uint64_t length) {
                  auto data = sess.read(offset, length);
                  // 返回 Python bytes
                  return py::bytes(
@@ -28,7 +28,7 @@ PYBIND11_MODULE(rdma_py, m) {
              py::arg("length"))
         .def("write",
              [](RdmaSession &sess,
-                std::uint32_t offset,
+                std::uint64_t offset,
                 py::bytes py_data) {
                  std::string buf = py_data;
                  sess.write(offset,

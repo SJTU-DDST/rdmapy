@@ -6,6 +6,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <iostream>
 
 #include <asio/co_spawn.hpp>
 #include <asio/io_context.hpp>
@@ -66,45 +67,108 @@ public:
     }
 
     // 同步 read
+        // 同步 read，支持跨多个 MR
     std::vector<uint8_t> read(uint64_t offset, uint64_t length) {
         std::lock_guard<std::mutex> lk(mutex_);
 
-        if (offset + length > total_len_)
+        if (offset + length > total_len_) {
             throw std::runtime_error("read out of range");
+        }
 
-        const auto& r = find_region(offset, length);
-        uint64_t in_mr_offset = offset - r.prefix_len;
-
-        std::vector<uint8_t> buffer(length);
-        auto span = std::as_writable_bytes(std::span(buffer));
-
-        void* addr = (void*)(r.addr + in_mr_offset);
-        rdmapp::remote_mr remote(addr, length, r.rkey);
+        // 用 shared_ptr 保证在协程中使用时生命周期安全
+        auto buffer = std::make_shared<std::vector<uint8_t>>(length);
 
         auto fut = asio::co_spawn(
-            *io_ctx_, qp_->read(remote, span), asio::use_future);
+            *io_ctx_,
+            [this, offset, length, buffer]() -> asio::awaitable<void> {
+                uint64_t cur_off = offset;
+                uint64_t remaining = length;
+                uint64_t dst_offset = 0;
+
+                while (remaining > 0) {
+                    const auto& r = find_region_by_offset(cur_off);
+                    uint64_t in_mr_offset = cur_off - r.prefix_len;
+                    uint64_t cap = r.length - in_mr_offset;        // 该 MR 中还能读多少
+                    uint64_t chunk = std::min<uint64_t>(remaining, cap);
+
+                    void* addr = (void*)(r.addr + in_mr_offset);
+                    rdmapp::remote_mr remote(addr, (uint32_t)chunk, r.rkey);
+
+                    auto span = std::as_writable_bytes(
+                        std::span(buffer->data() + dst_offset, chunk));
+
+                    co_await qp_->read(remote, span);
+
+                    cur_off    += chunk;
+                    dst_offset += chunk;
+                    remaining  -= chunk;
+                }
+                co_return;
+            }(),
+            asio::use_future
+        );
+
         fut.get();
-        return buffer;
+        return *buffer;
     }
 
-    // 同步 write
+
+        // 同步 write，支持跨多个 MR
     void write(uint64_t offset, const uint8_t* data, size_t len) {
         std::lock_guard<std::mutex> lk(mutex_);
 
-        if (offset + len > total_len_)
+        std::cerr << "[RdmaSession::write] offset=" << offset
+                  << " len=" << len
+                  << " total_len_=" << total_len_ << std::endl;
+
+        if (offset + len > total_len_) {
+            std::cerr << "[RdmaSession::write] OUT OF RANGE! "
+                      << "offset+len=" << (offset + len)
+                      << " total_len_=" << total_len_ << std::endl;
             throw std::runtime_error("write out of range");
+        }
 
-        const auto& r = find_region(offset, len);
-        uint64_t in_mr_offset = offset - r.prefix_len;
-
-        void* addr = (void*)(r.addr + in_mr_offset);
-        rdmapp::remote_mr remote(addr, (uint32_t)len, r.rkey);
-
-        auto span = std::as_bytes(std::span(data, len));
         auto fut = asio::co_spawn(
-            *io_ctx_, qp_->write(remote, span), asio::use_future);
+            *io_ctx_,
+            [this, offset, len, data]() -> asio::awaitable<void> {
+                uint64_t cur_off  = offset;
+                size_t   remaining = len;
+                const uint8_t* ptr = data;
+
+                while (remaining > 0) {
+                    const auto& r = find_region_by_offset(cur_off);
+                    uint64_t in_mr_offset = cur_off - r.prefix_len;
+                    uint64_t cap = r.length - in_mr_offset;      // 该 MR 中还能写多少
+                    uint64_t chunk = std::min<uint64_t>(
+                        (uint64_t)remaining, cap);
+
+                    std::cerr << "[RdmaSession::write] region prefix="
+                              << r.prefix_len
+                              << " region.len=" << r.length
+                              << " in_mr_offset=" << in_mr_offset
+                              << " chunk=" << chunk
+                              << " r.addr=" << std::hex << r.addr << std::dec
+                              << std::endl;
+
+                    void* addr = (void*)(r.addr + in_mr_offset);
+                    rdmapp::remote_mr remote(addr, (uint32_t)chunk, r.rkey);
+
+                    auto span = std::as_bytes(std::span(ptr, chunk));
+                    co_await qp_->write(remote, span);
+
+                    cur_off   += chunk;
+                    ptr       += chunk;
+                    remaining -= chunk;
+                }
+
+                co_return;
+            }(),
+            asio::use_future
+        );
+
         fut.get();
     }
+
 
 private:
     std::shared_ptr<rdmapp::qp> qp_;
@@ -114,6 +178,15 @@ private:
     uint64_t total_len_;
 
     std::mutex mutex_;
+
+    const remote_mr_info& find_region_by_offset(uint64_t offset) {
+        for (auto &r : regions_) {
+            if (offset >= r.prefix_len && offset < r.prefix_len + r.length) {
+                return r;
+            }
+        }
+        throw std::runtime_error("offset does not fit in any MR region");
+    }
 };
 
 // ====================================
