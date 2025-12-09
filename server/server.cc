@@ -15,18 +15,37 @@
 #include <rdmapp/executor.h>
 #include <rdmapp/mr.h>
 
-// 为了让 QP 和缓冲区不被析构，简单放到全局容器里
 static std::vector<std::shared_ptr<rdmapp::qp>> g_qps;
 static std::vector<std::shared_ptr<std::vector<std::uint8_t>>> g_buffers;
 static std::vector<std::shared_ptr<rdmapp::local_mr>> g_mrs;
 
+constexpr int NUM_MR_PER_CONN = 32;
 constexpr std::size_t KV_BUFFER_SIZE = 2ull << 30;
+
+constexpr int MAX_CONNECTIONS = 1;
+
+
+void release_oldest_connection() {
+    if (g_qps.empty()) return;
+
+    spdlog::warn("Max connections reached. Releasing oldest connection...");
+
+    // 1) 删除最旧的 QP
+    g_qps.erase(g_qps.begin());  // shared_ptr 减为零 → 自动析构 → 断连
+
+    // 2) 删除最旧连接的 32 个 MR + 32 个 buffer
+    g_mrs.erase(g_mrs.begin(), g_mrs.begin() + NUM_MR_PER_CONN);
+    g_buffers.erase(g_buffers.begin(), g_buffers.begin() + NUM_MR_PER_CONN);
+
+    spdlog::warn("Oldest connection released successfully.");
+}
+
 
 asio::awaitable<void> handle_qp(std::shared_ptr<rdmapp::qp> qp) {
     spdlog::info("handling qp (KV server)");
 
-    const int NUM_CHUNKS = 8;      // 2GB x 8 = 16GB
-    const size_t CHUNK_SIZE = 2ull << 30;
+    const int NUM_CHUNKS = NUM_MR_PER_CONN;   // 32
+    const size_t CHUNK_SIZE = KV_BUFFER_SIZE; // 2GB
 
     // 发送总 MR 数量（占 4 字节）
     {
@@ -64,35 +83,43 @@ asio::awaitable<void> handle_qp(std::shared_ptr<rdmapp::qp> qp) {
 
 
 asio::awaitable<void> server(std::shared_ptr<rdmapp::qp_acceptor> acceptor) {
-  while (true) {
-    auto qp = co_await acceptor->accept();
-    asio::co_spawn(co_await asio::this_coro::executor,
-                   handle_qp(qp),
-                   asio::detached);
-  }
+    while (true) {
+        auto qp = co_await acceptor->accept();
+
+        // 超过最大连接数 → 自动释放最旧连接
+        if (g_qps.size() >= MAX_CONNECTIONS) {
+            release_oldest_connection();
+        }
+
+        asio::co_spawn(
+            co_await asio::this_coro::executor,
+            handle_qp(qp),
+            asio::detached
+        );
+    }
 }
 
 int main(int argc, char *argv[]) {
-  if (argc != 2) {
-    std::cout << "Usage: " << argv[0] << " [port]" << std::endl;
-    return -1;
-  }
+    if (argc != 2) {
+        std::cout << "Usage: " << argv[0] << " [port]" << std::endl;
+        return -1;
+    }
 
-  spdlog::set_level(spdlog::level::debug);
+    spdlog::set_level(spdlog::level::debug);
 
-  auto device = std::make_shared<rdmapp::device>(1, 1);
-  auto pd     = std::make_shared<rdmapp::pd>(device);
-  auto cq     = std::make_shared<rdmapp::cq>(device);
-  auto io_ctx = std::make_shared<asio::io_context>(4);
-  auto executor  = std::make_shared<rdmapp::executor>(io_ctx);
-  auto cq_poller = std::make_shared<rdmapp::cq_poller>(cq, executor);
+    auto device = std::make_shared<rdmapp::device>(0, 1);
+    auto pd     = std::make_shared<rdmapp::pd>(device);
+    auto cq     = std::make_shared<rdmapp::cq>(device);
+    auto io_ctx = std::make_shared<asio::io_context>(4);
+    auto executor  = std::make_shared<rdmapp::executor>(io_ctx);
+    auto cq_poller = std::make_shared<rdmapp::cq_poller>(cq, executor);
 
-  uint16_t port = static_cast<uint16_t>(std::stoi(argv[1]));
-  auto acceptor = std::make_shared<rdmapp::qp_acceptor>(io_ctx, port, pd, cq);
+    uint16_t port = static_cast<uint16_t>(std::stoi(argv[1]));
+    auto acceptor = std::make_shared<rdmapp::qp_acceptor>(io_ctx, port, pd, cq);
 
-  auto work_guard = asio::make_work_guard(*io_ctx);
-  asio::co_spawn(*io_ctx, server(acceptor), asio::detached);
-  io_ctx->run();
+    auto work_guard = asio::make_work_guard(*io_ctx);
+    asio::co_spawn(*io_ctx, server(acceptor), asio::detached);
+    io_ctx->run();
 
-  return 0;
+    return 0;
 }
