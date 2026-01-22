@@ -117,9 +117,9 @@ public:
     void write(uint64_t offset, const uint8_t* data, size_t len) {
         std::lock_guard<std::mutex> lk(mutex_);
 
-        std::cerr << "[RdmaSession::write] offset=" << offset
-                  << " len=" << len
-                  << " total_len_=" << total_len_ << std::endl;
+        // std::cerr << "[RdmaSession::write] offset=" << offset
+        //           << " len=" << len
+        //           << " total_len_=" << total_len_ << std::endl;
 
         if (offset + len > total_len_) {
             std::cerr << "[RdmaSession::write] OUT OF RANGE! "
@@ -142,13 +142,13 @@ public:
                     uint64_t chunk = std::min<uint64_t>(
                         (uint64_t)remaining, cap);
 
-                    std::cerr << "[RdmaSession::write] region prefix="
-                              << r.prefix_len
-                              << " region.len=" << r.length
-                              << " in_mr_offset=" << in_mr_offset
-                              << " chunk=" << chunk
-                              << " r.addr=" << std::hex << r.addr << std::dec
-                              << std::endl;
+                    // std::cerr << "[RdmaSession::write] region prefix="
+                    //           << r.prefix_len
+                    //           << " region.len=" << r.length
+                    //           << " in_mr_offset=" << in_mr_offset
+                    //           << " chunk=" << chunk
+                    //           << " r.addr=" << std::hex << r.addr << std::dec
+                    //           << std::endl;
 
                     void* addr = (void*)(r.addr + in_mr_offset);
                     rdmapp::remote_mr remote(addr, (uint32_t)chunk, r.rkey);
