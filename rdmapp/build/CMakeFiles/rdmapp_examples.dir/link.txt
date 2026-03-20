@@ -1,0 +1,2 @@
+/usr/bin/ar qc librdmapp_examples.a CMakeFiles/rdmapp_examples.dir/examples/qp_transmission.cc.o CMakeFiles/rdmapp_examples.dir/examples/qp_acceptor.cc.o CMakeFiles/rdmapp_examples.dir/examples/qp_connector.cc.o CMakeFiles/rdmapp_examples.dir/examples/helloworld_handler.cc.o
+/usr/bin/ranlib librdmapp_examples.a

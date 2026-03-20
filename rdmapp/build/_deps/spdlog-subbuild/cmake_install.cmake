@@ -1,4 +1,4 @@
-# Install script for directory: /home/xingda/rdmapp/build/_deps/spdlog-subbuild
+# Install script for directory: /home/xingda/rdmapy/rdmapp/build/_deps/spdlog-subbuild
 
 # Set the install prefix
 if(NOT DEFINED CMAKE_INSTALL_PREFIX)
@@ -45,5 +45,5 @@ endif()
 
 string(REPLACE ";" "\n" CMAKE_INSTALL_MANIFEST_CONTENT
        "${CMAKE_INSTALL_MANIFEST_FILES}")
-file(WRITE "/home/xingda/rdmapp/build/_deps/spdlog-subbuild/${CMAKE_INSTALL_MANIFEST}"
+file(WRITE "/home/xingda/rdmapy/rdmapp/build/_deps/spdlog-subbuild/${CMAKE_INSTALL_MANIFEST}"
      "${CMAKE_INSTALL_MANIFEST_CONTENT}")

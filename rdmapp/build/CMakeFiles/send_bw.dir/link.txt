@@ -1,0 +1,1 @@
+/usr/bin/clang++ -O2 -g -DNDEBUG CMakeFiles/send_bw.dir/examples/send_bw.cc.o -o send_bw  librdmapp_examples.a _deps/fmt-build/libfmt.a _deps/spdlog-build/libspdlog.a librdmapp.a _deps/fmt-build/libfmt.a _deps/spdlog-build/libspdlog.a -libverbs 
