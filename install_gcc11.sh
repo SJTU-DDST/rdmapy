@@ -3,84 +3,74 @@ set -euo pipefail
 
 GCC_VER="11.4.0"
 PREFIX="${HOME}/local/gcc-${GCC_VER}"
-SRC_DIR="${HOME}/src"
+SRC_ROOT="${HOME}/src"
+GCC_SRC="${SRC_ROOT}/gcc-${GCC_VER}"
 BUILD_DIR="${HOME}/build/gcc-${GCC_VER}"
-TARBALL="gcc-${GCC_VER}.tar.xz"
-URL="https://ftp.gnu.org/gnu/gcc/gcc-${GCC_VER}/${TARBALL}"
 
-echo "[1/8] check base tools"
-for x in gcc g++ make tar xz; do
-  command -v "${x}" >/dev/null 2>&1 || {
-    echo "missing command: ${x}"
-    exit 1
-  }
-done
+mkdir -p "${SRC_ROOT}" "${BUILD_DIR}" "$(dirname "${PREFIX}")"
+cd "${SRC_ROOT}"
 
-mkdir -p "${SRC_DIR}" "${BUILD_DIR}" "$(dirname "${PREFIX}")"
-cd "${SRC_DIR}"
+download() {
+  local url="$1"
+  local file="$2"
+  if [ ! -f "$file" ]; then
+    wget --no-check-certificate -O "$file" "$url"
+  fi
+}
 
-echo "[2/8] download gcc ${GCC_VER}"
-if [ ! -f "${TARBALL}" ]; then
-  curl -L -o "${TARBALL}" "${URL}" || wget -O "${TARBALL}" "${URL}"
+echo "[1/7] 下载 GCC 源码"
+download "https://ftp.gnu.org/gnu/gcc/gcc-${GCC_VER}/gcc-${GCC_VER}.tar.xz" "gcc-${GCC_VER}.tar.xz"
+
+if [ ! -d "${GCC_SRC}" ]; then
+  tar -xf "gcc-${GCC_VER}.tar.xz"
 fi
 
-echo "[3/8] extract source"
-if [ ! -d "gcc-${GCC_VER}" ]; then
-  tar -xf "${TARBALL}"
-fi
+cd "${GCC_SRC}"
 
-cd "gcc-${GCC_VER}"
+echo "[2/7] 下载依赖源码"
+download "https://gcc.gnu.org/pub/gcc/infrastructure/gmp-6.1.0.tar.bz2" "gmp-6.1.0.tar.bz2"
+download "https://gcc.gnu.org/pub/gcc/infrastructure/mpfr-3.1.4.tar.bz2" "mpfr-3.1.4.tar.bz2"
+download "https://gcc.gnu.org/pub/gcc/infrastructure/mpc-1.0.3.tar.gz" "mpc-1.0.3.tar.gz"
+download "https://gcc.gnu.org/pub/gcc/infrastructure/isl-0.18.tar.bz2" "isl-0.18.tar.bz2"
 
-echo "[4/8] download prerequisites"
-./contrib/download_prerequisites
+echo "[3/7] 解压依赖"
+[ -d gmp-6.1.0 ] || tar -xf gmp-6.1.0.tar.bz2
+[ -d mpfr-3.1.4 ] || tar -xf mpfr-3.1.4.tar.bz2
+[ -d mpc-1.0.3 ] || tar -xf mpc-1.0.3.tar.gz
+[ -d isl-0.18 ] || tar -xf isl-0.18.tar.bz2
 
-echo "[5/8] configure"
+ln -sfn gmp-6.1.0 gmp
+ln -sfn mpfr-3.1.4 mpfr
+ln -sfn mpc-1.0.3 mpc
+ln -sfn isl-0.18 isl
+
+echo "[4/7] 配置"
 mkdir -p "${BUILD_DIR}"
 cd "${BUILD_DIR}"
 
-"${SRC_DIR}/gcc-${GCC_VER}/configure" \
+"${GCC_SRC}/configure" \
   --prefix="${PREFIX}" \
   --disable-multilib \
   --enable-languages=c,c++ \
   --disable-bootstrap
 
-echo "[6/8] build"
-CPU_N="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
-if [ "${CPU_N}" -gt 8 ]; then
-  CPU_N=8
+echo "[5/7] 编译"
+JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
+if [ "${JOBS}" -gt 8 ]; then
+  JOBS=8
 fi
-make -j"${CPU_N}"
+make -j"${JOBS}"
 
-echo "[7/8] install"
+echo "[6/7] 安装"
 make install
 
-echo "[8/8] done"
-cat <<EOF
-
-GCC ${GCC_VER} installed to:
-  ${PREFIX}
-
-Temporarily enable it in current shell:
-  export PATH=${PREFIX}/bin:\$PATH
-  export LD_LIBRARY_PATH=${PREFIX}/lib64:\$LD_LIBRARY_PATH
-  hash -r
-
-Check version:
-  gcc --version
-  g++ --version
-
-Use in cmake:
-  rm -rf build
-  cmake -B build \\
-    -DCMAKE_BUILD_TYPE=RelWithDebInfo \\
-    -DCMAKE_INSTALL_PREFIX=\$INSTALL_DIR \\
-    -DCMAKE_C_COMPILER=${PREFIX}/bin/gcc \\
-    -DCMAKE_CXX_COMPILER=${PREFIX}/bin/g++ \\
-    -DCMAKE_CXX_STANDARD=20 \\
-    -DCMAKE_CXX_STANDARD_REQUIRED=ON \\
-    -DCMAKE_CXX_EXTENSIONS=OFF \\
-    -DRDMAPP_BUILD_EXAMPLES_PYBIND=ON \\
-    -Dpybind11_DIR=\$(python3 -m pybind11 --cmakedir)
-
-  cmake --build build -j
-EOF
+echo "[7/7] 完成"
+echo
+echo "执行下面命令启用新 GCC:"
+echo "export PATH=${PREFIX}/bin:\$PATH"
+echo "export LD_LIBRARY_PATH=${PREFIX}/lib64:\$LD_LIBRARY_PATH"
+echo "hash -r"
+echo
+echo "检查版本:"
+echo "gcc --version"
+echo "g++ --version"
