@@ -1,0 +1,3 @@
+/home/xingda/rdmapy/build/CMakeFiles/rdma_py.dir
+/home/xingda/rdmapy/build/CMakeFiles/edit_cache.dir
+/home/xingda/rdmapy/build/CMakeFiles/rebuild_cache.dir
