@@ -1,2 +1,0 @@
-/usr/bin/ar qc librdmapp.a CMakeFiles/rdmapp.dir/src/device.cc.o CMakeFiles/rdmapp.dir/src/pd.cc.o CMakeFiles/rdmapp.dir/src/cq.cc.o CMakeFiles/rdmapp.dir/src/qp.cc.o CMakeFiles/rdmapp.dir/src/srq.cc.o CMakeFiles/rdmapp.dir/src/cq_poller.cc.o CMakeFiles/rdmapp.dir/src/executor.cc.o CMakeFiles/rdmapp.dir/src/mr.cc.o
-/usr/bin/ranlib librdmapp.a
