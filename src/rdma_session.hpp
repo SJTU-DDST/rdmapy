@@ -77,6 +77,9 @@ public:
             info.rkey = r.rkey();
             info.prefix_len = prefix;
 
+            if (r.length() > std::numeric_limits<uint64_t>::max() - prefix) {
+                throw std::runtime_error("remote MR total length overflows uint64");
+            }
             prefix += r.length();
             regions_.push_back(info);
         }
@@ -122,6 +125,9 @@ public:
 
     // 根据 offset 找 MR
     const remote_mr_info& find_region(uint64_t offset, uint64_t len) {
+        if (len > total_len_ || offset > total_len_ - len) {
+            throw std::runtime_error("offset does not fit in any MR region");
+        }
         uint64_t end = offset + len;
         for (auto &r : regions_) {
             if (offset >= r.prefix_len &&
@@ -137,7 +143,7 @@ public:
     std::vector<uint8_t> read(uint64_t offset, uint64_t length) {
         std::lock_guard<std::mutex> lk(mutex_);
 
-        if (offset + length > total_len_) {
+        if (length > total_len_ || offset > total_len_ - length) {
             throw std::runtime_error("read out of range");
         }
 
@@ -155,7 +161,10 @@ public:
                     const auto& r = find_region_by_offset(cur_off);
                     uint64_t in_mr_offset = cur_off - r.prefix_len;
                     uint64_t cap = r.length - in_mr_offset;        // 该 MR 中还能读多少
-                    uint64_t chunk = std::min<uint64_t>(remaining, cap);
+                    uint64_t max_wr_bytes = std::numeric_limits<uint32_t>::max();
+                    uint64_t chunk = std::min<uint64_t>(
+                        std::min<uint64_t>(remaining, cap),
+                        max_wr_bytes);
 
                     void* addr = (void*)(r.addr + in_mr_offset);
                     rdmapp::remote_mr remote(addr, (uint32_t)chunk, r.rkey);
@@ -259,9 +268,9 @@ public:
         //           << " len=" << len
         //           << " total_len_=" << total_len_ << std::endl;
 
-        if (offset + len > total_len_) {
+        if (len > total_len_ || offset > total_len_ - len) {
             std::cerr << "[RdmaSession::write] OUT OF RANGE! "
-                      << "offset+len=" << (offset + len)
+                      << "offset=" << offset << " len=" << len
                       << " total_len_=" << total_len_ << std::endl;
             throw std::runtime_error("write out of range");
         }
@@ -277,8 +286,10 @@ public:
                     const auto& r = find_region_by_offset(cur_off);
                     uint64_t in_mr_offset = cur_off - r.prefix_len;
                     uint64_t cap = r.length - in_mr_offset;      // 该 MR 中还能写多少
+                    uint64_t max_wr_bytes = std::numeric_limits<uint32_t>::max();
                     uint64_t chunk = std::min<uint64_t>(
-                        (uint64_t)remaining, cap);
+                        std::min<uint64_t>((uint64_t)remaining, cap),
+                        max_wr_bytes);
 
                     // std::cerr << "[RdmaSession::write] region prefix="
                     //           << r.prefix_len

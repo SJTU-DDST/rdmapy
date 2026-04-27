@@ -115,6 +115,21 @@ target_link_libraries(rdmapp PUBLIC fmt spdlog)
 target_include_directories(rdmapp PUBLIC include)
 target_link_libraries(rdmapp PUBLIC asio)
 
+set(RDMAPP_QP_HELPER_SOURCE_FILES
+  examples/qp_transmission.cc
+  examples/qp_acceptor.cc
+  examples/qp_connector.cc
+)
+
+# These files live under examples/ in upstream rdmapp, but rdmapy and the RDMA
+# server depend on them for the TCP QP handshake. Keep them as an explicit
+# helper target so callers do not have to guess which example sources are core.
+add_library(rdmapp_qp_helpers STATIC ${RDMAPP_QP_HELPER_SOURCE_FILES})
+target_compile_options(rdmapp_qp_helpers ${RDMAPP_COMPILE_OPTIONS})
+target_include_directories(rdmapp_qp_helpers PUBLIC examples/include)
+target_link_libraries(rdmapp_qp_helpers PUBLIC rdmapp)
+target_link_options(rdmapp_qp_helpers ${RDMAPP_LINK_OPTIONS})
+
 find_program(iwyu_path NAMES include-what-you-use iwyu)
 
 if(iwyu_path)
@@ -124,16 +139,13 @@ endif()
 
 if(RDMAPP_BUILD_EXAMPLES)
   set(RDMAPP_EXAMPLES_LIB_SOURCE_FILES
-    examples/qp_transmission.cc
-    examples/qp_acceptor.cc
-    examples/qp_connector.cc
     examples/helloworld_handler.cc
   )
 
   add_library(rdmapp_examples STATIC ${RDMAPP_EXAMPLES_LIB_SOURCE_FILES})
   target_compile_options(rdmapp_examples ${RDMAPP_COMPILE_OPTIONS})
   target_include_directories(rdmapp_examples PUBLIC examples/include)
-  target_link_libraries(rdmapp_examples PUBLIC rdmapp)
+  target_link_libraries(rdmapp_examples PUBLIC rdmapp_qp_helpers)
   target_link_options(rdmapp_examples ${RDMAPP_LINK_OPTIONS})
   set(RDMAPP_EXAMPLES helloworld send_bw write_bw rpc)
 
@@ -148,13 +160,22 @@ if(RDMAPP_BUILD_EXAMPLES)
     # NOTE: this is how to configure a pybind cmake project with rdmapp
     message("-- [deps] pybind: looking for pybind11")
     find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
-    find_package(pybind11 CONFIG REQUIRED)
+    execute_process(
+      COMMAND "${Python3_EXECUTABLE}" -m pybind11 --cmakedir
+      RESULT_VARIABLE PYBIND11_CMAKEDIR_RESULT
+      OUTPUT_VARIABLE PYBIND11_CMAKEDIR
+      ERROR_QUIET
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
+    if(PYBIND11_CMAKEDIR_RESULT EQUAL 0 AND EXISTS "${PYBIND11_CMAKEDIR}")
+      list(PREPEND CMAKE_PREFIX_PATH "${PYBIND11_CMAKEDIR}")
+      message(STATUS "Using pybind11 from Python environment: ${PYBIND11_CMAKEDIR}")
+    endif()
+
+    find_package(pybind11 2.13 CONFIG REQUIRED)
     pybind11_add_module(
       rdmapp_py
       examples/pybind11/helloworld.cc
-      examples/qp_transmission.cc
-      examples/qp_acceptor.cc
-      examples/qp_connector.cc
       examples/helloworld_handler.cc
     )
 
@@ -165,7 +186,7 @@ if(RDMAPP_BUILD_EXAMPLES)
     # fucking tricky problems.
     target_include_directories(rdmapp_py PUBLIC examples/include)
     target_compile_options(rdmapp_py PRIVATE -Wall -Wextra -pedantic)
-    target_link_libraries(rdmapp_py PRIVATE rdmapp)
+    target_link_libraries(rdmapp_py PRIVATE rdmapp_qp_helpers)
   endif()
 endif()
 

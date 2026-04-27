@@ -104,8 +104,8 @@ Requires: C++ compiler with C++20 standard support and `libibverbs` development 
 git clone https://github.com/SJTU-DDST/rdmapp && cd rdmapp
 cmake -Bbuild -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_INSTALL_PREFIX=$INSTALL_DIR .
 # for shared library build, use -DRDMAPP_BUILD_PIC=ON
-# for pybind11, see examples, use -DRDMAPP_BUILD_EXAMPLES_PYBIND=ON
-# for no RTTI build, use -RDMAPP_BUILD_NORTTI=ON
+# the pybind11 module under examples is optional; Python 3.13 needs pybind11>=2.13
+# for no RTTI build, use -DRDMAPP_BUILD_NORTTI=ON
 cmake --build build
 ```
 
@@ -128,6 +128,11 @@ fetchcontent_declare(
 fetchcontent_makeavailable(rdmapp)
 
 target_link_libraries(your_target PUBLIC rdmapp)
+
+# If your target uses qp_acceptor/qp_connector from examples/include, link the
+# helper target too. Those TCP handshake helpers live under examples upstream,
+# but they are required by rdmapy and the RDMA server.
+target_link_libraries(your_target PUBLIC rdmapp_qp_helpers)
 ```
 
 ## Developing
