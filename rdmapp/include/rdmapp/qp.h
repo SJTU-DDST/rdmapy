@@ -3,6 +3,7 @@
 #include <asio/awaitable.hpp>
 #include <atomic>
 #include <coroutine>
+#include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <memory>
@@ -89,6 +90,8 @@ public:
     std::shared_ptr<qp> qp_;
     std::shared_ptr<local_mr> local_mr_;
     std::exception_ptr exception_;
+    void *local_addr_ = nullptr;
+    size_t local_length_ = 0;
     remote_mr remote_mr_;
     uint64_t compare_add_;
     uint64_t swap_;
@@ -113,6 +116,9 @@ public:
     send_awaitable(std::shared_ptr<qp> qp, std::shared_ptr<local_mr> local_mr,
                    enum ibv_wr_opcode opcode);
     send_awaitable(std::shared_ptr<qp> qp, std::shared_ptr<local_mr> local_mr,
+                   enum ibv_wr_opcode opcode, remote_mr const &remote_mr);
+    send_awaitable(std::shared_ptr<qp> qp, std::shared_ptr<local_mr> local_mr,
+                   void *local_addr, size_t local_length,
                    enum ibv_wr_opcode opcode, remote_mr const &remote_mr);
     send_awaitable(std::shared_ptr<qp> qp, std::shared_ptr<local_mr> local_mr,
                    enum ibv_wr_opcode opcode, remote_mr const &remote_mr,
@@ -417,6 +423,10 @@ public:
   [[nodiscard]] asio::awaitable<send_result>
   write(remote_mr const &remote_mr, std::shared_ptr<local_mr> local_mr);
 
+  [[nodiscard]] asio::awaitable<send_result>
+  write(remote_mr const &remote_mr, std::shared_ptr<local_mr> local_mr,
+        void *local_addr, size_t length);
+
   /**
    * @brief This function writes a registered local memory region to remote
    * with an immediate value.
@@ -448,6 +458,10 @@ public:
 
   [[nodiscard]] asio::awaitable<send_result>
   read(remote_mr const &remote_mr, std::shared_ptr<local_mr> local_mr);
+
+  [[nodiscard]] asio::awaitable<send_result>
+  read(remote_mr const &remote_mr, std::shared_ptr<local_mr> local_mr,
+       void *local_addr, size_t length);
 
   /**
    * @brief This function performs an atomic fetch-and-add operation on the

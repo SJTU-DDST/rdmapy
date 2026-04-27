@@ -13,6 +13,7 @@
 #include <endian.h>
 #include <exception>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -215,37 +216,66 @@ void qp::post_recv_srq(struct ibv_recv_wr const &recv_wr,
            "failed to post srq recv");
 }
 
+static inline void validate_local_sge_range(local_mr const &mr, void *addr,
+                                            size_t length) {
+  auto base = reinterpret_cast<uintptr_t>(mr.addr());
+  auto ptr = reinterpret_cast<uintptr_t>(addr);
+  auto mr_length = mr.length();
+  if (length > std::numeric_limits<uint32_t>::max()) [[unlikely]] {
+    throw std::runtime_error("local SGE length exceeds uint32_t");
+  }
+  if (ptr < base || ptr - base > mr_length ||
+      length > mr_length - (ptr - base)) [[unlikely]] {
+    throw std::runtime_error("local SGE range is outside registered MR");
+  }
+}
+
 qp::send_awaitable::send_awaitable(std::shared_ptr<qp> qp, void *buffer,
                                    size_t length, enum ibv_wr_opcode opcode)
     : qp_(qp),
       local_mr_(std::make_shared<local_mr>(qp_->pd_->reg_mr(buffer, length))),
-      remote_mr_(), wc_(), opcode_(opcode) {}
+      local_addr_(buffer), local_length_(length),
+      remote_mr_(), wc_(), opcode_(opcode) {
+  validate_local_sge_range(*local_mr_, local_addr_, local_length_);
+}
 qp::send_awaitable::send_awaitable(std::shared_ptr<qp> qp, void *buffer,
                                    size_t length, enum ibv_wr_opcode opcode,
                                    remote_mr const &remote_mr)
     : qp_(qp),
       local_mr_(std::make_shared<local_mr>(qp_->pd_->reg_mr(buffer, length))),
-      remote_mr_(remote_mr), opcode_(opcode) {}
+      local_addr_(buffer), local_length_(length),
+      remote_mr_(remote_mr), opcode_(opcode) {
+  validate_local_sge_range(*local_mr_, local_addr_, local_length_);
+}
 qp::send_awaitable::send_awaitable(std::shared_ptr<qp> qp, void *buffer,
                                    size_t length, enum ibv_wr_opcode opcode,
                                    remote_mr const &remote_mr, uint32_t imm)
     : qp_(qp),
       local_mr_(std::make_shared<local_mr>(qp_->pd_->reg_mr(buffer, length))),
-      remote_mr_(remote_mr), imm_(imm), opcode_(opcode) {}
+      local_addr_(buffer), local_length_(length),
+      remote_mr_(remote_mr), imm_(imm), opcode_(opcode) {
+  validate_local_sge_range(*local_mr_, local_addr_, local_length_);
+}
 qp::send_awaitable::send_awaitable(std::shared_ptr<qp> qp, void *buffer,
                                    size_t length, enum ibv_wr_opcode opcode,
                                    remote_mr const &remote_mr, uint64_t add)
     : qp_(qp),
       local_mr_(std::make_shared<local_mr>(qp_->pd_->reg_mr(buffer, length))),
-      remote_mr_(remote_mr), compare_add_(add), opcode_(opcode) {}
+      local_addr_(buffer), local_length_(length),
+      remote_mr_(remote_mr), compare_add_(add), opcode_(opcode) {
+  validate_local_sge_range(*local_mr_, local_addr_, local_length_);
+}
 qp::send_awaitable::send_awaitable(std::shared_ptr<qp> qp, void *buffer,
                                    size_t length, enum ibv_wr_opcode opcode,
                                    remote_mr const &remote_mr, uint64_t compare,
                                    uint64_t swap)
     : qp_(qp),
       local_mr_(std::make_shared<local_mr>(qp_->pd_->reg_mr(buffer, length))),
+      local_addr_(buffer), local_length_(length),
       remote_mr_(remote_mr), compare_add_(compare), swap_(swap),
-      opcode_(opcode) {}
+      opcode_(opcode) {
+  validate_local_sge_range(*local_mr_, local_addr_, local_length_);
+}
 
 qp::send_awaitable::send_awaitable(std::shared_ptr<qp> qp,
                                    std::span<std::byte> buffer,
@@ -291,39 +321,70 @@ qp::send_awaitable::send_awaitable(std::shared_ptr<qp> qp,
 qp::send_awaitable::send_awaitable(std::shared_ptr<qp> qp,
                                    std::shared_ptr<local_mr> local_mr,
                                    enum ibv_wr_opcode opcode)
-    : qp_(qp), local_mr_(local_mr), remote_mr_(), wc_(), opcode_(opcode) {}
+    : qp_(qp), local_mr_(local_mr), local_addr_(local_mr->addr()),
+      local_length_(local_mr->length()), remote_mr_(), wc_(),
+      opcode_(opcode) {
+  validate_local_sge_range(*local_mr_, local_addr_, local_length_);
+}
 qp::send_awaitable::send_awaitable(std::shared_ptr<qp> qp,
                                    std::shared_ptr<local_mr> local_mr,
                                    enum ibv_wr_opcode opcode,
                                    remote_mr const &remote_mr)
-    : qp_(qp), local_mr_(local_mr), remote_mr_(remote_mr), opcode_(opcode) {}
+    : qp_(qp), local_mr_(local_mr), local_addr_(local_mr->addr()),
+      local_length_(local_mr->length()), remote_mr_(remote_mr),
+      opcode_(opcode) {
+  validate_local_sge_range(*local_mr_, local_addr_, local_length_);
+}
+qp::send_awaitable::send_awaitable(std::shared_ptr<qp> qp,
+                                   std::shared_ptr<local_mr> local_mr,
+                                   void *local_addr, size_t local_length,
+                                   enum ibv_wr_opcode opcode,
+                                   remote_mr const &remote_mr)
+    : qp_(qp), local_mr_(local_mr), local_addr_(local_addr),
+      local_length_(local_length), remote_mr_(remote_mr), opcode_(opcode) {
+  validate_local_sge_range(*local_mr_, local_addr_, local_length_);
+}
 qp::send_awaitable::send_awaitable(std::shared_ptr<qp> qp,
                                    std::shared_ptr<local_mr> local_mr,
                                    enum ibv_wr_opcode opcode,
                                    remote_mr const &remote_mr, uint32_t imm)
-    : qp_(qp), local_mr_(local_mr), remote_mr_(remote_mr), imm_(imm),
-      opcode_(opcode) {}
+    : qp_(qp), local_mr_(local_mr), local_addr_(local_mr->addr()),
+      local_length_(local_mr->length()), remote_mr_(remote_mr), imm_(imm),
+      opcode_(opcode) {
+  validate_local_sge_range(*local_mr_, local_addr_, local_length_);
+}
 qp::send_awaitable::send_awaitable(std::shared_ptr<qp> qp,
                                    std::shared_ptr<local_mr> local_mr,
                                    enum ibv_wr_opcode opcode,
                                    remote_mr const &remote_mr, uint64_t add)
-    : qp_(qp), local_mr_(local_mr), remote_mr_(remote_mr), compare_add_(add),
-      opcode_(opcode) {}
+    : qp_(qp), local_mr_(local_mr), local_addr_(local_mr->addr()),
+      local_length_(local_mr->length()), remote_mr_(remote_mr),
+      compare_add_(add), opcode_(opcode) {
+  validate_local_sge_range(*local_mr_, local_addr_, local_length_);
+}
 qp::send_awaitable::send_awaitable(std::shared_ptr<qp> qp,
                                    std::shared_ptr<local_mr> local_mr,
                                    enum ibv_wr_opcode opcode,
                                    remote_mr const &remote_mr,
 
                                    uint64_t compare, uint64_t swap)
-    : qp_(qp), local_mr_(local_mr), remote_mr_(remote_mr),
-      compare_add_(compare), swap_(swap), opcode_(opcode) {}
+    : qp_(qp), local_mr_(local_mr), local_addr_(local_mr->addr()),
+      local_length_(local_mr->length()), remote_mr_(remote_mr),
+      compare_add_(compare), swap_(swap), opcode_(opcode) {
+  validate_local_sge_range(*local_mr_, local_addr_, local_length_);
+}
 
-static inline struct ibv_sge fill_local_sge(local_mr const &mr) {
+static inline struct ibv_sge fill_local_sge(local_mr const &mr, void *addr,
+                                            size_t length) {
   struct ibv_sge sge = {};
-  sge.addr = reinterpret_cast<uint64_t>(mr.addr());
-  sge.length = mr.length();
+  sge.addr = reinterpret_cast<uint64_t>(addr);
+  sge.length = static_cast<uint32_t>(length);
   sge.lkey = mr.lkey();
   return sge;
+}
+
+static inline struct ibv_sge fill_local_sge(local_mr const &mr) {
+  return fill_local_sge(mr, mr.addr(), mr.length());
 }
 
 bool qp::send_awaitable::await_ready() const noexcept { return false; }
@@ -336,7 +397,7 @@ bool qp::send_awaitable::await_suspend(std::coroutine_handle<> h) noexcept {
 }
 
 bool qp::send_awaitable::suspend(executor::callback_ptr callback) noexcept {
-  auto send_sge = fill_local_sge(*local_mr_);
+  auto send_sge = fill_local_sge(*local_mr_, local_addr_, local_length_);
 
   struct ibv_send_wr send_wr = {};
   struct ibv_send_wr *bad_send_wr = nullptr;
@@ -601,6 +662,15 @@ asio::awaitable<qp::send_result> qp::write(remote_mr const &remote_mr,
   return make_asio_awaitable(std::move(awaitable));
 }
 
+asio::awaitable<qp::send_result>
+qp::write(remote_mr const &remote_mr, std::shared_ptr<local_mr> local_mr,
+          void *local_addr, size_t length) {
+  auto awaitable = std::make_unique<qp::send_awaitable>(
+      this->shared_from_this(), local_mr, local_addr, length,
+      IBV_WR_RDMA_WRITE, remote_mr);
+  return make_asio_awaitable(std::move(awaitable));
+}
+
 qp::send_awaitable qp::async_write(remote_mr const &remote_mr,
                                    std::shared_ptr<local_mr> local_mr) {
   return qp::send_awaitable(this->shared_from_this(), local_mr,
@@ -627,6 +697,15 @@ asio::awaitable<qp::send_result> qp::read(remote_mr const &remote_mr,
                                           std::shared_ptr<local_mr> local_mr) {
   auto awaitable = std::make_unique<qp::send_awaitable>(
       this->shared_from_this(), local_mr, IBV_WR_RDMA_READ, remote_mr);
+  return make_asio_awaitable(std::move(awaitable));
+}
+
+asio::awaitable<qp::send_result>
+qp::read(remote_mr const &remote_mr, std::shared_ptr<local_mr> local_mr,
+         void *local_addr, size_t length) {
+  auto awaitable = std::make_unique<qp::send_awaitable>(
+      this->shared_from_this(), local_mr, local_addr, length, IBV_WR_RDMA_READ,
+      remote_mr);
   return make_asio_awaitable(std::move(awaitable));
 }
 
