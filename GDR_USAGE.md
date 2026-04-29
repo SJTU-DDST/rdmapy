@@ -10,8 +10,12 @@ session.write(offset, bytes_payload)
 and adds CUDA tensor APIs:
 
 ```python
-session.read_into_tensor(offset, tensor, nbytes=None, tensor_offset_bytes=0, chunk_bytes=64 * 1024 * 1024)
-session.write_from_tensor(offset, tensor, nbytes=None, tensor_offset_bytes=0, chunk_bytes=64 * 1024 * 1024)
+session.read_into_tensor(
+    offset, tensor, nbytes=None, tensor_offset_bytes=0,
+    chunk_bytes=64 * 1024 * 1024, max_inflight=16, debug=False)
+session.write_from_tensor(
+    offset, tensor, nbytes=None, tensor_offset_bytes=0,
+    chunk_bytes=64 * 1024 * 1024, max_inflight=16, debug=False)
 ```
 
 `Endpoint` also accepts the RDMA device index so you can choose the NIC closest
@@ -66,8 +70,36 @@ CUDA staging tensors for repeated GDR reads/writes.
 Minimal round-trip test:
 
 ```bash
-python examples/gdr_tensor_smoke.py --host <server-ip> --port 2333 --device cuda:0 --ib-device 1
+python examples/gdr_tensor_smoke.py --host <server-ip> --port 2333 --device cuda:0 --ib-device 1 --max-inflight 16 --debug
 ```
+
+Bandwidth sweep:
+
+```bash
+python examples/gdr_tensor_bench.py --host <server-ip> --port 2333 --device cuda:0 --ib-device 1 --bytes 512m --chunk-bytes 4m,16m,64m --max-inflight 1,4,8,16
+```
+
+`max_inflight` posts multiple RDMA WRs before waiting for a completion. For
+RDMA read it is clamped to the QP's configured `max_rd_atomic` value (16 in
+this tree). For RDMA write it can be higher, but it is still bounded by the QP
+send queue capacity. `debug=True` prints per-call bytes, chunks, elapsed time,
+estimated GB/s, and MR-cache deltas.
+
+Sequoia's `RdmaBackend` also exposes the staging and debug knobs through
+environment variables:
+
+```bash
+SEQUOIA_GDR_STAGE_BYTES=67108864
+SEQUOIA_GDR_RDMA_CHUNK_BYTES=16777216
+SEQUOIA_GDR_MAX_INFLIGHT=16
+SEQUOIA_GDR_DEBUG=1
+```
+
+`SEQUOIA_GDR_STAGE_BYTES=4194304` restores the old conservative 4MB staging
+size if a specific GDR driver stack still rejects larger CUDA registrations.
+`SEQUOIA_GDR_RDMA_CHUNK_BYTES` controls the WR size inside each staging
+transfer; with `SEQUOIA_GDR_MAX_INFLIGHT=16`, a 64MB stage and 16MB WRs posts
+up to four RDMA operations before waiting.
 
 Runtime prerequisites:
 

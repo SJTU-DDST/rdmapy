@@ -11,6 +11,15 @@ executor::executor(std::shared_ptr<asio::io_context> io_context)
 void executor::process_wc(struct ibv_wc const &wc) {
   auto fn = [wc] {
     spdlog::trace("process_wc: {:#x}", wc.wr_id);
+    if (wc.wr_id == 0) {
+      if (wc.status != IBV_WC_SUCCESS) {
+        spdlog::error("completion for unsignaled WR failed: status={} vendor_err={}",
+                      static_cast<int>(wc.status), wc.vendor_err);
+      } else {
+        spdlog::trace("completion for unsignaled WR ignored");
+      }
+      return;
+    }
     auto cb = reinterpret_cast<callback_ptr>(wc.wr_id);
     (*cb)(wc);
     spdlog::trace("process_wc done: {:#x}", wc.wr_id);

@@ -1,7 +1,9 @@
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <algorithm>
+#include <condition_variable>
 #include <functional>
 #include <list>
 #include <memory>
@@ -198,9 +200,9 @@ public:
                    uint64_t length,
                    uint64_t chunk_bytes = 64ull * 1024 * 1024,
                    std::shared_ptr<void> owner = nullptr,
-                   uint64_t register_length = 0) {
-        std::lock_guard<std::mutex> lk(mutex_);
-
+                   uint64_t register_length = 0,
+                   uint32_t max_inflight = 16,
+                   bool debug = false) {
         if (length > total_len_ || offset > total_len_ - length) {
             throw std::runtime_error("read_into out of range");
         }
@@ -220,43 +222,38 @@ public:
             throw std::runtime_error("read_into register_length is smaller than length");
         }
 
-        auto local_mr = get_cached_local_mr(
-            local_addr, register_length, std::move(owner));
+        uint64_t hits_before = 0;
+        uint64_t misses_before = 0;
+        std::shared_ptr<rdmapp::local_mr> local_mr;
+        {
+            std::lock_guard<std::mutex> lk(mutex_);
+            hits_before = mr_cache_hits_;
+            misses_before = mr_cache_misses_;
+            local_mr = get_cached_local_mr(
+                local_addr, register_length, std::move(owner));
+        }
 
-        auto fut = asio::co_spawn(
-            *io_ctx_,
-            [this, offset, local_addr, length, chunk_bytes, local_mr]() -> asio::awaitable<void> {
-                uint64_t cur_off = offset;
-                uint64_t remaining = length;
-                uint64_t dst_offset = 0;
-
-                while (remaining > 0) {
-                    const auto& r = find_region_by_offset(cur_off);
-                    uint64_t in_mr_offset = cur_off - r.prefix_len;
-                    uint64_t cap = r.length - in_mr_offset;
-                    uint64_t max_wr_bytes = std::min<uint64_t>(
-                        chunk_bytes,
-                        std::numeric_limits<uint32_t>::max());
-                    uint64_t chunk = std::min<uint64_t>(
-                        std::min<uint64_t>(remaining, cap),
-                        max_wr_bytes);
-
-                    void* remote_addr = (void*)(r.addr + in_mr_offset);
-                    rdmapp::remote_mr remote(remote_addr, (uint32_t)chunk, r.rkey);
-
-                    auto* dst = reinterpret_cast<void*>(local_addr + dst_offset);
-                    co_await qp_->read(remote, local_mr, dst, static_cast<size_t>(chunk));
-
-                    cur_off    += chunk;
-                    dst_offset += chunk;
-                    remaining  -= chunk;
-                }
-                co_return;
-            }(),
-            asio::use_future
+        auto t0 = std::chrono::steady_clock::now();
+        size_t chunks = post_windowed_rdma(
+            IBV_WR_RDMA_READ,
+            offset,
+            local_addr,
+            length,
+            chunk_bytes,
+            local_mr,
+            max_inflight
         );
-
-        fut.get();
+        debug_report(
+            debug,
+            "read_into",
+            offset,
+            length,
+            chunk_bytes,
+            max_inflight,
+            chunks,
+            t0,
+            hits_before,
+            misses_before);
     }
 
 
@@ -329,9 +326,9 @@ public:
                     uint64_t length,
                     uint64_t chunk_bytes = 64ull * 1024 * 1024,
                     std::shared_ptr<void> owner = nullptr,
-                    uint64_t register_length = 0) {
-        std::lock_guard<std::mutex> lk(mutex_);
-
+                    uint64_t register_length = 0,
+                    uint32_t max_inflight = 16,
+                    bool debug = false) {
         if (length > total_len_ || offset > total_len_ - length) {
             std::cerr << "[RdmaSession::write_from] OUT OF RANGE! "
                       << "offset=" << offset << " len=" << length
@@ -354,43 +351,38 @@ public:
             throw std::runtime_error("write_from register_length is smaller than length");
         }
 
-        auto local_mr = get_cached_local_mr(
-            local_addr, register_length, std::move(owner));
+        uint64_t hits_before = 0;
+        uint64_t misses_before = 0;
+        std::shared_ptr<rdmapp::local_mr> local_mr;
+        {
+            std::lock_guard<std::mutex> lk(mutex_);
+            hits_before = mr_cache_hits_;
+            misses_before = mr_cache_misses_;
+            local_mr = get_cached_local_mr(
+                local_addr, register_length, std::move(owner));
+        }
 
-        auto fut = asio::co_spawn(
-            *io_ctx_,
-            [this, offset, local_addr, length, chunk_bytes, local_mr]() -> asio::awaitable<void> {
-                uint64_t cur_off = offset;
-                uint64_t remaining = length;
-                uint64_t src_offset = 0;
-
-                while (remaining > 0) {
-                    const auto& r = find_region_by_offset(cur_off);
-                    uint64_t in_mr_offset = cur_off - r.prefix_len;
-                    uint64_t cap = r.length - in_mr_offset;
-                    uint64_t max_wr_bytes = std::min<uint64_t>(
-                        chunk_bytes,
-                        std::numeric_limits<uint32_t>::max());
-                    uint64_t chunk = std::min<uint64_t>(
-                        std::min<uint64_t>(remaining, cap),
-                        max_wr_bytes);
-
-                    void* remote_addr = (void*)(r.addr + in_mr_offset);
-                    rdmapp::remote_mr remote(remote_addr, (uint32_t)chunk, r.rkey);
-
-                    auto* src = reinterpret_cast<void*>(local_addr + src_offset);
-                    co_await qp_->write(remote, local_mr, src, static_cast<size_t>(chunk));
-
-                    cur_off    += chunk;
-                    src_offset += chunk;
-                    remaining  -= chunk;
-                }
-                co_return;
-            }(),
-            asio::use_future
+        auto t0 = std::chrono::steady_clock::now();
+        size_t chunks = post_windowed_rdma(
+            IBV_WR_RDMA_WRITE,
+            offset,
+            local_addr,
+            length,
+            chunk_bytes,
+            local_mr,
+            max_inflight
         );
-
-        fut.get();
+        debug_report(
+            debug,
+            "write_from",
+            offset,
+            length,
+            chunk_bytes,
+            max_inflight,
+            chunks,
+            t0,
+            hits_before,
+            misses_before);
     }
 
 
@@ -402,6 +394,14 @@ private:
     uint64_t total_len_;
 
     std::mutex mutex_;
+    std::mutex send_mutex_;
+    std::mutex post_mutex_;
+    std::condition_variable send_cv_;
+    size_t outstanding_send_wrs_ = 0;
+
+    static constexpr uint32_t kMaxSendWr = 128;
+    static constexpr uint32_t kSendWrSlack = 1;
+    static constexpr uint32_t kMaxReadInflight = 16;
 
     size_t max_cached_mrs_ = 16;
     uint64_t mr_cache_hits_ = 0;
@@ -478,6 +478,222 @@ private:
         }
         uint64_t delta = static_cast<uint64_t>(addr - key.addr);
         return delta <= key.length && length <= key.length - delta;
+    }
+
+    struct rdma_chunk {
+        const remote_mr_info* region;
+        uint64_t in_mr_offset;
+        uint64_t local_offset;
+        uint32_t bytes;
+    };
+
+    struct batch_state {
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool done = false;
+        std::exception_ptr exception;
+    };
+
+    std::vector<rdma_chunk> make_chunks(
+        uint64_t offset,
+        uint64_t length,
+        uint64_t chunk_bytes) {
+        std::vector<rdma_chunk> chunks;
+        uint64_t cur_off = offset;
+        uint64_t remaining = length;
+        uint64_t local_offset = 0;
+        uint64_t max_wr_bytes = std::min<uint64_t>(
+            chunk_bytes,
+            std::numeric_limits<uint32_t>::max());
+
+        while (remaining > 0) {
+            const auto& r = find_region_by_offset(cur_off);
+            uint64_t in_mr_offset = cur_off - r.prefix_len;
+            uint64_t cap = r.length - in_mr_offset;
+            uint64_t chunk = std::min<uint64_t>(
+                std::min<uint64_t>(remaining, cap),
+                max_wr_bytes);
+
+            chunks.push_back(rdma_chunk{
+                &r,
+                in_mr_offset,
+                local_offset,
+                static_cast<uint32_t>(chunk),
+            });
+
+            cur_off += chunk;
+            local_offset += chunk;
+            remaining -= chunk;
+        }
+
+        return chunks;
+    }
+
+    uint32_t effective_window(enum ibv_wr_opcode opcode,
+                              uint32_t max_inflight) const {
+        uint32_t window = std::clamp<uint32_t>(
+            max_inflight,
+            1,
+            kMaxSendWr - kSendWrSlack);
+        if (opcode == IBV_WR_RDMA_READ) {
+            window = std::min<uint32_t>(window, kMaxReadInflight);
+        }
+        return window;
+    }
+
+    void reserve_send_wrs(size_t wrs) {
+        if (wrs == 0) {
+            return;
+        }
+        const size_t usable = kMaxSendWr - kSendWrSlack;
+        if (wrs > usable) {
+            throw std::runtime_error("RDMA window exceeds QP send queue capacity");
+        }
+
+        std::unique_lock<std::mutex> lk(send_mutex_);
+        send_cv_.wait(lk, [this, wrs, usable] {
+            return outstanding_send_wrs_ + wrs <= usable;
+        });
+        outstanding_send_wrs_ += wrs;
+    }
+
+    void release_send_wrs(size_t wrs) {
+        {
+            std::lock_guard<std::mutex> lk(send_mutex_);
+            if (wrs > outstanding_send_wrs_) {
+                outstanding_send_wrs_ = 0;
+            } else {
+                outstanding_send_wrs_ -= wrs;
+            }
+        }
+        send_cv_.notify_all();
+    }
+
+    size_t post_windowed_rdma(
+        enum ibv_wr_opcode opcode,
+        uint64_t offset,
+        std::uintptr_t local_addr,
+        uint64_t length,
+        uint64_t chunk_bytes,
+        std::shared_ptr<rdmapp::local_mr> local_mr,
+        uint32_t max_inflight) {
+        auto chunks = make_chunks(offset, length, chunk_bytes);
+        if (chunks.empty()) {
+            return 0;
+        }
+
+        uint32_t window = effective_window(opcode, max_inflight);
+
+        for (size_t begin = 0; begin < chunks.size(); begin += window) {
+            size_t end = std::min<size_t>(begin + window, chunks.size());
+            size_t window_len = end - begin;
+            auto state = std::make_shared<batch_state>();
+            reserve_send_wrs(window_len);
+
+            try {
+                for (size_t i = begin; i < end; ++i) {
+                    const auto& chunk = chunks[i];
+                    const bool signaled = (i + 1 == end);
+
+                    rdmapp::executor::callback_ptr callback = nullptr;
+                    if (signaled) {
+                        callback = rdmapp::executor::make_callback(
+                            [state](struct ibv_wc const &wc) {
+                                {
+                                    std::lock_guard<std::mutex> lk(state->mutex);
+                                    if (wc.status != IBV_WC_SUCCESS) {
+                                        state->exception = std::make_exception_ptr(
+                                            std::runtime_error(
+                                                std::string("windowed RDMA failed: ") +
+                                                ibv_wc_status_str(wc.status)));
+                                    }
+                                    state->done = true;
+                                }
+                                state->cv.notify_one();
+                            });
+                    }
+
+                    struct ibv_sge sge = {};
+                    sge.addr = static_cast<uint64_t>(local_addr + chunk.local_offset);
+                    sge.length = chunk.bytes;
+                    sge.lkey = local_mr->lkey();
+
+                    struct ibv_send_wr send_wr = {};
+                    struct ibv_send_wr *bad_send_wr = nullptr;
+                    send_wr.opcode = opcode;
+                    send_wr.next = nullptr;
+                    send_wr.num_sge = 1;
+                    send_wr.sg_list = &sge;
+                    send_wr.wr_id = signaled ? reinterpret_cast<uint64_t>(callback) : 0;
+                    send_wr.send_flags = signaled ? IBV_SEND_SIGNALED : 0;
+                    send_wr.wr.rdma.remote_addr =
+                        static_cast<uint64_t>(chunk.region->addr + chunk.in_mr_offset);
+                    send_wr.wr.rdma.rkey = chunk.region->rkey;
+
+                    try {
+                        std::lock_guard<std::mutex> post_lk(post_mutex_);
+                        qp_->post_send(send_wr, bad_send_wr);
+                    } catch (...) {
+                        if (callback != nullptr) {
+                            rdmapp::executor::destroy_callback(callback);
+                        }
+                        throw;
+                    }
+                }
+
+                std::unique_lock<std::mutex> lk(state->mutex);
+                state->cv.wait(lk, [&state] { return state->done; });
+                if (state->exception) {
+                    std::rethrow_exception(state->exception);
+                }
+            } catch (...) {
+                release_send_wrs(window_len);
+                throw;
+            }
+            release_send_wrs(window_len);
+        }
+        return chunks.size();
+    }
+
+    void debug_report(
+        bool debug,
+        const char* op,
+        uint64_t offset,
+        uint64_t length,
+        uint64_t chunk_bytes,
+        uint32_t max_inflight,
+        size_t chunks,
+        std::chrono::steady_clock::time_point t0,
+        uint64_t hits_before,
+        uint64_t misses_before) {
+        if (!debug) {
+            return;
+        }
+        auto t1 = std::chrono::steady_clock::now();
+        double seconds = std::chrono::duration<double>(t1 - t0).count();
+        double gib = static_cast<double>(length) / (1024.0 * 1024.0 * 1024.0);
+        double gibps = seconds > 0.0 ? gib / seconds : 0.0;
+        uint64_t hits_after = 0;
+        uint64_t misses_after = 0;
+        size_t cache_size = 0;
+        {
+            std::lock_guard<std::mutex> lk(mutex_);
+            hits_after = mr_cache_hits_;
+            misses_after = mr_cache_misses_;
+            cache_size = mr_cache_.size();
+        }
+        std::cerr << "[RdmaSession][GDR] " << op
+                  << " offset=" << offset
+                  << " bytes=" << length
+                  << " chunk_bytes=" << chunk_bytes
+                  << " max_inflight=" << max_inflight
+                  << " chunks=" << chunks
+                  << " seconds=" << seconds
+                  << " GiB/s=" << gibps
+                  << " mr_cache_size=" << cache_size
+                  << " mr_hits+=" << (hits_after - hits_before)
+                  << " mr_misses+=" << (misses_after - misses_before)
+                  << std::endl;
     }
 
     const remote_mr_info& find_region_by_offset(uint64_t offset) {

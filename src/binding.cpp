@@ -127,7 +127,9 @@ PYBIND11_MODULE(rdma_py, m) {
                 py::object tensor,
                 py::object py_nbytes,
                 std::uint64_t tensor_offset_bytes,
-                std::uint64_t chunk_bytes) {
+                std::uint64_t chunk_bytes,
+                std::uint32_t max_inflight,
+                bool debug) {
                  auto span = tensor_span(
                      tensor, py_nbytes, tensor_offset_bytes,
                      true /* require_cuda */);
@@ -140,7 +142,9 @@ PYBIND11_MODULE(rdma_py, m) {
                          span.nbytes,
                          chunk_bytes,
                          std::move(owner),
-                         span.register_nbytes);
+                         span.register_nbytes,
+                         max_inflight,
+                         debug);
                  }
                  return span.nbytes;
              },
@@ -148,14 +152,18 @@ PYBIND11_MODULE(rdma_py, m) {
              py::arg("tensor"),
              py::arg("nbytes") = py::none(),
              py::arg("tensor_offset_bytes") = 0,
-             py::arg("chunk_bytes") = kDefaultChunkBytes)
+             py::arg("chunk_bytes") = kDefaultChunkBytes,
+             py::arg("max_inflight") = 16,
+             py::arg("debug") = false)
         .def("write_from_tensor",
              [](RdmaSession &sess,
                 std::uint64_t offset,
                 py::object tensor,
                 py::object py_nbytes,
                 std::uint64_t tensor_offset_bytes,
-                std::uint64_t chunk_bytes) {
+                std::uint64_t chunk_bytes,
+                std::uint32_t max_inflight,
+                bool debug) {
                  auto span = tensor_span(
                      tensor, py_nbytes, tensor_offset_bytes,
                      true /* require_cuda */);
@@ -168,7 +176,9 @@ PYBIND11_MODULE(rdma_py, m) {
                          span.nbytes,
                          chunk_bytes,
                          std::move(owner),
-                         span.register_nbytes);
+                         span.register_nbytes,
+                         max_inflight,
+                         debug);
                  }
                  return span.nbytes;
              },
@@ -176,7 +186,9 @@ PYBIND11_MODULE(rdma_py, m) {
              py::arg("tensor"),
              py::arg("nbytes") = py::none(),
              py::arg("tensor_offset_bytes") = 0,
-             py::arg("chunk_bytes") = kDefaultChunkBytes)
+             py::arg("chunk_bytes") = kDefaultChunkBytes,
+             py::arg("max_inflight") = 16,
+             py::arg("debug") = false)
         .def("mr_cache_size",
              &RdmaSession::mr_cache_size)
         .def("mr_cache_limit",
