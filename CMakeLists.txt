@@ -1,46 +1,64 @@
-cmake_minimum_required(VERSION 3.14)
+cmake_minimum_required(VERSION 3.22)
 project(rdma_py CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-# ===== rdmapp 路径（你给过的结构）=====
-set(RDMAPP_DIR "/home/xingda/rdmapp")
+get_filename_component(RDMAPP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/rdmapp" ABSOLUTE)
+message(STATUS "Using bundled rdmapp: ${RDMAPP_DIR}")
+if(NOT EXISTS "${RDMAPP_DIR}/CMakeLists.txt")
+    message(FATAL_ERROR "Bundled rdmapp is missing. Expected: ${RDMAPP_DIR}")
+endif()
+foreach(RDMAPP_EXAMPLE_SOURCE
+        qp_acceptor.cc
+        qp_connector.cc
+        qp_transmission.cc)
+    if(NOT EXISTS "${RDMAPP_DIR}/examples/${RDMAPP_EXAMPLE_SOURCE}")
+        message(FATAL_ERROR
+            "Bundled rdmapp example source is missing: "
+            "${RDMAPP_DIR}/examples/${RDMAPP_EXAMPLE_SOURCE}")
+    endif()
+endforeach()
 
-# ===== include 路径 =====
-include_directories(
-    ${RDMAPP_DIR}/include
-    ${RDMAPP_DIR}/examples/include
-    ${RDMAPP_DIR}/build/_deps/asio-src/asio/include
-    ${RDMAPP_DIR}/build/_deps/spdlog-src/include
-    ${RDMAPP_DIR}/build/_deps/fmt-src/include
+set(RDMAPP_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(RDMAPP_BUILD_DOCS OFF CACHE BOOL "" FORCE)
+set(RDMAPP_BUILD_EXAMPLES_PYBIND OFF CACHE BOOL "" FORCE)
+set(RDMAPP_BUILD_NORTTI OFF CACHE BOOL "" FORCE)
+set(RDMAPP_BUILD_PIC ON CACHE BOOL "" FORCE)
+add_subdirectory(${RDMAPP_DIR} ${CMAKE_CURRENT_BINARY_DIR}/rdmapp-build)
 
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
+# ===== 找 Python / pybind11 =====
+find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
+execute_process(
+    COMMAND "${Python3_EXECUTABLE}" -m pybind11 --cmakedir
+    RESULT_VARIABLE PYBIND11_CMAKEDIR_RESULT
+    OUTPUT_VARIABLE PYBIND11_CMAKEDIR
+    ERROR_QUIET
+    OUTPUT_STRIP_TRAILING_WHITESPACE
 )
+if(PYBIND11_CMAKEDIR_RESULT EQUAL 0 AND EXISTS "${PYBIND11_CMAKEDIR}")
+    list(PREPEND CMAKE_PREFIX_PATH "${PYBIND11_CMAKEDIR}")
+    message(STATUS "Using pybind11 from Python environment: ${PYBIND11_CMAKEDIR}")
+endif()
 
-# ===== 找 pybind11 =====
-find_package(pybind11 REQUIRED)
+find_package(pybind11 2.13 CONFIG REQUIRED)
 
 # ===== 构建 python 模块 =====
 pybind11_add_module(rdma_py
     src/binding.cpp
     src/rdma_session.hpp            # header-only不会编译，但可以写进去无所谓
+)
 
-    # ❗ 必须加入你们 rdmapp/examples 下的实现
-    ${RDMAPP_DIR}/examples/qp_acceptor.cc
-    ${RDMAPP_DIR}/examples/qp_connector.cc
-    ${RDMAPP_DIR}/examples/qp_transmission.cc
+target_compile_features(rdma_py PRIVATE cxx_std_20)
+
+target_include_directories(rdma_py
+    PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${RDMAPP_DIR}/examples/include
 )
 
 # ===== 链接 rdmapp 和系统库 =====
 target_link_libraries(rdma_py
     PRIVATE
-    rdmapp
-    ibverbs
-    pthread
-)
-
-# ===== 让 linker 能找到 librdmapp.a =====
-target_link_directories(rdma_py PRIVATE
-    ${RDMAPP_DIR}/build
+    rdmapp_qp_helpers
 )
