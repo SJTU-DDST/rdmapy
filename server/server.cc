@@ -4,9 +4,12 @@
 #include <asio/this_coro.hpp>
 #include <asio/steady_timer.hpp>
 #include <cstdint>
+#include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -29,8 +32,8 @@ static std::vector<std::shared_ptr<rdmapp::local_mr>> g_mrs;
 constexpr int NUM_MR_PER_CONN = 64;
 constexpr std::size_t KV_BUFFER_SIZE = 2ull << 30;
 
-// 最大连接数
-constexpr int MAX_CONNECTIONS = 1;
+// Maximum live QPs. Multi-QP bandwidth tests create one connection per QP.
+static int g_max_connections = 64;
 
 // 简单背压：同一时间只允许一个 handle_qp 在跑
 static bool g_handling = false;
@@ -106,7 +109,7 @@ asio::awaitable<void> server(std::shared_ptr<rdmapp::qp_acceptor> acceptor) {
     while (true) {
         auto qp = co_await acceptor->accept();
 
-        if (g_qps.size() >= MAX_CONNECTIONS) {
+        if (g_qps.size() >= static_cast<std::size_t>(g_max_connections)) {
             release_oldest_connection();
         }
 
@@ -135,15 +138,108 @@ asio::awaitable<void> server(std::shared_ptr<rdmapp::qp_acceptor> acceptor) {
 // ==============================
 // main
 // ==============================
+struct ServerOptions {
+    uint16_t port = 2333;
+    int ib_device = 0;
+    int ib_port = 1;
+    int max_connections = 64;
+};
+
+static void print_usage(const char *prog) {
+    std::cout
+        << "Usage:\n"
+        << "  " << prog << " [port]\n"
+        << "  " << prog << " --port PORT [--ib-device DEV] [--ib-port PORT] "
+        << "[--max-connections N]\n\n"
+        << "Defaults:\n"
+        << "  --port 2333 --ib-device 0 --ib-port 1 --max-connections 64\n";
+}
+
+static int parse_int_arg(const std::string &name,
+                         const std::string &value,
+                         int min_value,
+                         int max_value) {
+    try {
+        size_t consumed = 0;
+        int parsed = std::stoi(value, &consumed);
+        if (consumed != value.size()) {
+            throw std::invalid_argument("trailing characters");
+        }
+        if (parsed < min_value || parsed > max_value) {
+            throw std::out_of_range("outside allowed range");
+        }
+        return parsed;
+    } catch (const std::exception &e) {
+        throw std::runtime_error(
+            "invalid " + name + "=" + value + ": " + e.what());
+    }
+}
+
+static ServerOptions parse_args(int argc, char *argv[]) {
+    ServerOptions opts;
+    bool positional_port_seen = false;
+
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "-h" || arg == "--help") {
+            print_usage(argv[0]);
+            std::exit(0);
+        }
+
+        auto require_value = [&](const std::string &flag) -> std::string {
+            if (i + 1 >= argc) {
+                throw std::runtime_error(flag + " requires a value");
+            }
+            return argv[++i];
+        };
+
+        if (arg == "--port") {
+            opts.port = static_cast<uint16_t>(
+                parse_int_arg(arg, require_value(arg), 1, 65535));
+        } else if (arg == "--ib-device") {
+            opts.ib_device = parse_int_arg(
+                arg, require_value(arg), 0, std::numeric_limits<int>::max());
+        } else if (arg == "--ib-port") {
+            opts.ib_port = parse_int_arg(
+                arg, require_value(arg), 1, std::numeric_limits<int>::max());
+        } else if (arg == "--max-connections") {
+            opts.max_connections = parse_int_arg(
+                arg, require_value(arg), 1, std::numeric_limits<int>::max());
+        } else if (!arg.empty() && arg[0] == '-') {
+            throw std::runtime_error("unknown argument: " + arg);
+        } else {
+            if (positional_port_seen) {
+                throw std::runtime_error("multiple positional ports provided");
+            }
+            opts.port = static_cast<uint16_t>(
+                parse_int_arg("port", arg, 1, 65535));
+            positional_port_seen = true;
+        }
+    }
+
+    return opts;
+}
+
 int main(int argc, char *argv[]) {
-    if (argc != 2) {
-        std::cout << "Usage: " << argv[0] << " [port]" << std::endl;
+    ServerOptions opts;
+    try {
+        opts = parse_args(argc, argv);
+    } catch (const std::exception &e) {
+        std::cerr << "Argument error: " << e.what() << "\n\n";
+        print_usage(argv[0]);
         return -1;
     }
 
+    g_max_connections = opts.max_connections;
     spdlog::set_level(spdlog::level::debug);
+    spdlog::info(
+        "Starting RDMA server on port {}, ib_device={}, ib_port={}, max_connections={}",
+        opts.port,
+        opts.ib_device,
+        opts.ib_port,
+        opts.max_connections);
 
-    auto device = std::make_shared<rdmapp::device>(0, 1);
+    auto device = std::make_shared<rdmapp::device>(opts.ib_device, opts.ib_port);
     auto pd     = std::make_shared<rdmapp::pd>(device);
     auto cq     = std::make_shared<rdmapp::cq>(device);
 
@@ -160,8 +256,8 @@ int main(int argc, char *argv[]) {
     // ✅ 启动时一次性注册 MR（核心改动）
     init_global_mr_pool(pd);
 
-    uint16_t port = static_cast<uint16_t>(std::stoi(argv[1]));
-    auto acceptor = std::make_shared<rdmapp::qp_acceptor>(io_ctx, port, pd, cq);
+    auto acceptor = std::make_shared<rdmapp::qp_acceptor>(
+        io_ctx, opts.port, pd, cq);
 
     auto work_guard = asio::make_work_guard(*io_ctx);
     asio::co_spawn(*io_ctx, server(acceptor), asio::detached);

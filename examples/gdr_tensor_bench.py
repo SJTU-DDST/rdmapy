@@ -61,9 +61,15 @@ def main():
     parser.add_argument("--offset", type=parse_size, default=0)
     parser.add_argument("--bytes", dest="nbytes", type=parse_size, default=parse_size("256m"))
     parser.add_argument("--dtype", default="int32")
+    parser.add_argument("--stage-bytes", type=parse_size, default=parse_size("64m"))
     parser.add_argument("--chunk-bytes", type=parse_size_list, default=parse_size_list("4m,16m,64m"))
     parser.add_argument("--max-inflight", type=parse_int_list, default=parse_int_list("1,4,8,16"))
     parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument(
+        "--direct",
+        action="store_true",
+        help="Register one full-size tensor. This may fail on GDR stacks that reject large CUDA MRs.",
+    )
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 
@@ -78,23 +84,36 @@ def main():
     nbytes = numel * elem_size
     if numel <= 0:
         raise ValueError("--bytes is smaller than one dtype element")
+    stage_bytes = min(args.stage_bytes, nbytes)
+    stage_numel = max(1, stage_bytes // elem_size)
+    stage_bytes = stage_numel * elem_size
 
     endpoint = rdma_py.Endpoint(args.ib_port, args.ib_device)
     session = endpoint.connect(args.host, args.port)
 
-    src = fill_tensor(numel, dtype, args.device).contiguous()
-    dst = torch.empty_like(src)
+    if args.direct:
+        src = fill_tensor(numel, dtype, args.device).contiguous()
+        dst = torch.empty_like(src)
+    else:
+        src = fill_tensor(stage_numel, dtype, args.device).contiguous()
+        dst = torch.empty_like(src)
     torch.cuda.synchronize()
 
     print(
-        "bytes={} dtype={} numel={} device={} repeats={}".format(
-            nbytes, dtype, numel, args.device, args.repeats
+        "bytes={} dtype={} numel={} device={} repeats={} mode={} stage_bytes={}".format(
+            nbytes,
+            dtype,
+            numel,
+            args.device,
+            args.repeats,
+            "direct" if args.direct else "staged",
+            nbytes if args.direct else stage_bytes,
         )
     )
     print("chunk_bytes,max_inflight,write_GBps,read_GBps,ok")
 
-    for chunk_bytes in args.chunk_bytes:
-        for max_inflight in args.max_inflight:
+    def write_total(chunk_bytes: int, max_inflight: int):
+        if args.direct:
             session.write_from_tensor(
                 args.offset,
                 src,
@@ -103,6 +122,23 @@ def main():
                 max_inflight=max_inflight,
                 debug=args.debug,
             )
+            return
+
+        written = 0
+        while written < nbytes:
+            this_bytes = min(stage_bytes, nbytes - written)
+            session.write_from_tensor(
+                args.offset + written,
+                src,
+                nbytes=this_bytes,
+                chunk_bytes=chunk_bytes,
+                max_inflight=max_inflight,
+                debug=args.debug,
+            )
+            written += this_bytes
+
+    def read_total(chunk_bytes: int, max_inflight: int):
+        if args.direct:
             session.read_into_tensor(
                 args.offset,
                 dst,
@@ -111,40 +147,53 @@ def main():
                 max_inflight=max_inflight,
                 debug=args.debug,
             )
+            return nbytes
+
+        read_bytes = 0
+        last_bytes = 0
+        while read_bytes < nbytes:
+            this_bytes = min(stage_bytes, nbytes - read_bytes)
+            session.read_into_tensor(
+                args.offset + read_bytes,
+                dst,
+                nbytes=this_bytes,
+                chunk_bytes=chunk_bytes,
+                max_inflight=max_inflight,
+                debug=args.debug,
+            )
+            read_bytes += this_bytes
+            last_bytes = this_bytes
+        return last_bytes
+
+    def check_last_chunk(last_bytes: int) -> bool:
+        elems = last_bytes // elem_size
+        return torch.equal(src[:elems], dst[:elems])
+
+    for chunk_bytes in args.chunk_bytes:
+        for max_inflight in args.max_inflight:
+            write_total(chunk_bytes, max_inflight)
+            last_bytes = read_total(chunk_bytes, max_inflight)
             torch.cuda.synchronize()
 
             write_seconds = 0.0
             read_seconds = 0.0
             for _ in range(args.repeats):
                 t0 = time.perf_counter()
-                session.write_from_tensor(
-                    args.offset,
-                    src,
-                    nbytes=nbytes,
-                    chunk_bytes=chunk_bytes,
-                    max_inflight=max_inflight,
-                    debug=args.debug,
-                )
+                write_total(chunk_bytes, max_inflight)
                 write_seconds += time.perf_counter() - t0
 
                 t0 = time.perf_counter()
-                session.read_into_tensor(
-                    args.offset,
-                    dst,
-                    nbytes=nbytes,
-                    chunk_bytes=chunk_bytes,
-                    max_inflight=max_inflight,
-                    debug=args.debug,
-                )
+                last_bytes = read_total(chunk_bytes, max_inflight)
                 read_seconds += time.perf_counter() - t0
 
             torch.cuda.synchronize()
-            ok = torch.equal(src, dst)
+            ok = check_last_chunk(last_bytes)
             write_gbps = (nbytes * args.repeats) / write_seconds / 1e9
             read_gbps = (nbytes * args.repeats) / read_seconds / 1e9
             print(f"{chunk_bytes},{max_inflight},{write_gbps:.2f},{read_gbps:.2f},{ok}")
             if not ok:
-                diff = (src != dst).nonzero()
+                elems = last_bytes // elem_size
+                diff = (src[:elems] != dst[:elems]).nonzero()
                 first = diff[0].item() if diff.numel() else -1
                 raise RuntimeError(f"GDR roundtrip mismatch at element {first}")
 
