@@ -5,6 +5,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -131,6 +132,7 @@ PYBIND11_MODULE(rdma_py, m) {
                 std::uint64_t tensor_offset_bytes,
                 std::uint64_t chunk_bytes,
                 std::uint32_t max_inflight,
+                std::uint64_t pace_us,
                 bool debug) {
                  auto span = tensor_span(
                      tensor, py_nbytes, tensor_offset_bytes,
@@ -178,9 +180,21 @@ PYBIND11_MODULE(rdma_py, m) {
                  {
                      py::gil_scoped_release release;
                      const std::uint32_t total_iters = warmup + repeats;
+                     const auto interval =
+                         std::chrono::microseconds(pace_us);
+                     auto next_issue = std::chrono::steady_clock::now();
                      for (std::uint32_t iteration = 0;
                           iteration < total_iters;
                           ++iteration) {
+                         if (pace_us > 0 && iteration > 0) {
+                             next_issue += interval;
+                             auto now = std::chrono::steady_clock::now();
+                             if (next_issue > now) {
+                                 std::this_thread::sleep_until(next_issue);
+                             } else {
+                                 next_issue = now;
+                             }
+                         }
                          auto t0 = std::chrono::steady_clock::now();
                          sess.read_into(
                              offset,
@@ -210,6 +224,7 @@ PYBIND11_MODULE(rdma_py, m) {
              py::arg("tensor_offset_bytes") = 0,
              py::arg("chunk_bytes") = kDefaultChunkBytes,
              py::arg("max_inflight") = 1,
+             py::arg("pace_us") = 0,
              py::arg("debug") = false)
         .def("write_from_tensor",
              [](RdmaSession &sess,
