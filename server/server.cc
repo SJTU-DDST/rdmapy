@@ -25,11 +25,11 @@
 
 static std::vector<std::shared_ptr<rdmapp::qp>> g_qps;
 
-// 只分配/注册一次：32 个 buffer + 32 个 MR
+// 只分配/注册一次：全局 buffer + MR 池，所有 QP 共享这些 MR
 static std::vector<std::shared_ptr<std::vector<std::uint8_t>>> g_buffers;
 static std::vector<std::shared_ptr<rdmapp::local_mr>> g_mrs;
 
-constexpr int NUM_MR_PER_CONN = 64;
+constexpr int NUM_GLOBAL_MR = 64;
 constexpr std::size_t KV_BUFFER_SIZE = 2ull << 30;
 
 // Maximum live QPs. Multi-QP bandwidth tests create one connection per QP.
@@ -53,12 +53,12 @@ void release_oldest_connection() {
 // ==============================
 static void init_global_mr_pool(std::shared_ptr<rdmapp::pd> pd) {
     spdlog::info("Pre-allocating {} buffers and registering MRs ({} bytes each)...",
-                 NUM_MR_PER_CONN, KV_BUFFER_SIZE);
+                 NUM_GLOBAL_MR, KV_BUFFER_SIZE);
 
-    g_buffers.reserve(NUM_MR_PER_CONN);
-    g_mrs.reserve(NUM_MR_PER_CONN);
+    g_buffers.reserve(NUM_GLOBAL_MR);
+    g_mrs.reserve(NUM_GLOBAL_MR);
 
-    for (int i = 0; i < NUM_MR_PER_CONN; i++) {
+    for (int i = 0; i < NUM_GLOBAL_MR; i++) {
         auto kv_buf = std::make_shared<std::vector<uint8_t>>(KV_BUFFER_SIZE);
 
         // 注意：这里用 pd 注册一次即可；后续连接只复用 MR 信息
@@ -126,7 +126,13 @@ asio::awaitable<void> server(std::shared_ptr<rdmapp::qp_acceptor> acceptor) {
         asio::co_spawn(
             ex,
             [qp]() -> asio::awaitable<void> {
-                co_await handle_qp(qp);
+                try {
+                    co_await handle_qp(qp);
+                } catch (const std::exception &e) {
+                    spdlog::error("handle_qp failed: {}", e.what());
+                } catch (...) {
+                    spdlog::error("handle_qp failed with unknown exception");
+                }
                 g_handling = false;
                 co_return;
             }(),

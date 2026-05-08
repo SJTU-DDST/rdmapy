@@ -1,4 +1,6 @@
 #include <cstdint>
+#include <chrono>
+#include <cstddef>
 #include <limits>
 #include <memory>
 #include <stdexcept>
@@ -155,6 +157,60 @@ PYBIND11_MODULE(rdma_py, m) {
              py::arg("chunk_bytes") = kDefaultChunkBytes,
              py::arg("max_inflight") = 16,
              py::arg("debug") = false)
+        .def("read_into_tensor_latencies_us",
+             [](RdmaSession &sess,
+                std::uint64_t offset,
+                py::object tensor,
+                py::object py_nbytes,
+                std::uint32_t repeats,
+                std::uint32_t warmup,
+                std::uint64_t tensor_offset_bytes,
+                std::uint64_t chunk_bytes,
+                std::uint32_t max_inflight,
+                bool debug) {
+                 auto span = tensor_span(
+                     tensor, py_nbytes, tensor_offset_bytes,
+                     true /* require_cuda */);
+                 auto owner = keep_python_object_alive(tensor);
+                 std::vector<double> latencies_us;
+                 latencies_us.reserve(repeats);
+
+                 {
+                     py::gil_scoped_release release;
+                     const std::uint32_t total_iters = warmup + repeats;
+                     for (std::uint32_t iteration = 0;
+                          iteration < total_iters;
+                          ++iteration) {
+                         auto t0 = std::chrono::steady_clock::now();
+                         sess.read_into(
+                             offset,
+                             span.addr,
+                             span.nbytes,
+                             chunk_bytes,
+                             owner,
+                             span.register_nbytes,
+                             max_inflight,
+                             debug);
+                         auto t1 = std::chrono::steady_clock::now();
+                         if (iteration >= warmup) {
+                             latencies_us.push_back(
+                                 std::chrono::duration<double, std::micro>(
+                                     t1 - t0).count());
+                         }
+                     }
+                 }
+
+                 return latencies_us;
+             },
+             py::arg("offset"),
+             py::arg("tensor"),
+             py::arg("nbytes") = py::none(),
+             py::arg("repeats") = 100,
+             py::arg("warmup") = 10,
+             py::arg("tensor_offset_bytes") = 0,
+             py::arg("chunk_bytes") = kDefaultChunkBytes,
+             py::arg("max_inflight") = 1,
+             py::arg("debug") = false)
         .def("write_from_tensor",
              [](RdmaSession &sess,
                 std::uint64_t offset,
@@ -209,9 +265,11 @@ PYBIND11_MODULE(rdma_py, m) {
              });
 
     py::class_<RdmaEndpoint>(m, "Endpoint")
-        .def(py::init<int, int>(),
+        .def(py::init<int, int, std::uint32_t, std::size_t>(),
              py::arg("ib_port") = 1,
-             py::arg("device_num") = 1)
+             py::arg("device_num") = 1,
+             py::arg("io_workers") = 1,
+             py::arg("cq_batch_size") = 16)
         .def("connect",
              &RdmaEndpoint::connect,
              py::arg("host"),

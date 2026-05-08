@@ -234,15 +234,29 @@ public:
         }
 
         auto t0 = std::chrono::steady_clock::now();
-        size_t chunks = post_windowed_rdma(
-            IBV_WR_RDMA_READ,
-            offset,
-            local_addr,
-            length,
-            chunk_bytes,
-            local_mr,
-            max_inflight
-        );
+        size_t chunks = 0;
+        const remote_mr_info* single_region =
+            length <= chunk_bytes ? find_region_for_range(offset, length) : nullptr;
+        if (single_region != nullptr &&
+            length <= std::numeric_limits<uint32_t>::max()) {
+            chunks = post_single_rdma(
+                IBV_WR_RDMA_READ,
+                *single_region,
+                offset,
+                local_addr,
+                static_cast<uint32_t>(length),
+                local_mr);
+        } else {
+            chunks = post_windowed_rdma(
+                IBV_WR_RDMA_READ,
+                offset,
+                local_addr,
+                length,
+                chunk_bytes,
+                local_mr,
+                max_inflight
+            );
+        }
         debug_report(
             debug,
             "read_into",
@@ -363,15 +377,29 @@ public:
         }
 
         auto t0 = std::chrono::steady_clock::now();
-        size_t chunks = post_windowed_rdma(
-            IBV_WR_RDMA_WRITE,
-            offset,
-            local_addr,
-            length,
-            chunk_bytes,
-            local_mr,
-            max_inflight
-        );
+        size_t chunks = 0;
+        const remote_mr_info* single_region =
+            length <= chunk_bytes ? find_region_for_range(offset, length) : nullptr;
+        if (single_region != nullptr &&
+            length <= std::numeric_limits<uint32_t>::max()) {
+            chunks = post_single_rdma(
+                IBV_WR_RDMA_WRITE,
+                *single_region,
+                offset,
+                local_addr,
+                static_cast<uint32_t>(length),
+                local_mr);
+        } else {
+            chunks = post_windowed_rdma(
+                IBV_WR_RDMA_WRITE,
+                offset,
+                local_addr,
+                length,
+                chunk_bytes,
+                local_mr,
+                max_inflight
+            );
+        }
         debug_report(
             debug,
             "write_from",
@@ -493,6 +521,86 @@ private:
         bool done = false;
         std::exception_ptr exception;
     };
+
+    const remote_mr_info* find_region_for_range(uint64_t offset,
+                                                uint64_t length) {
+        uint64_t end = offset + length;
+        for (auto &r : regions_) {
+            if (offset >= r.prefix_len &&
+                end <= r.prefix_len + r.length) {
+                return &r;
+            }
+        }
+        return nullptr;
+    }
+
+    size_t post_single_rdma(
+        enum ibv_wr_opcode opcode,
+        const remote_mr_info& region,
+        uint64_t offset,
+        std::uintptr_t local_addr,
+        uint32_t length,
+        std::shared_ptr<rdmapp::local_mr> local_mr) {
+        batch_state state;
+        reserve_send_wrs(1);
+
+        rdmapp::executor::callback_ptr callback =
+            rdmapp::executor::make_callback(
+                [&state](struct ibv_wc const &wc) {
+                    {
+                        std::lock_guard<std::mutex> lk(state.mutex);
+                        if (wc.status != IBV_WC_SUCCESS) {
+                            state.exception = std::make_exception_ptr(
+                                std::runtime_error(
+                                    std::string("single RDMA failed: ") +
+                                    ibv_wc_status_str(wc.status)));
+                        }
+                        state.done = true;
+                    }
+                    state.cv.notify_one();
+                });
+        bool callback_owned_by_caller = true;
+
+        try {
+            struct ibv_sge sge = {};
+            sge.addr = static_cast<uint64_t>(local_addr);
+            sge.length = length;
+            sge.lkey = local_mr->lkey();
+
+            struct ibv_send_wr send_wr = {};
+            struct ibv_send_wr *bad_send_wr = nullptr;
+            send_wr.opcode = opcode;
+            send_wr.next = nullptr;
+            send_wr.num_sge = 1;
+            send_wr.sg_list = &sge;
+            send_wr.wr_id = reinterpret_cast<uint64_t>(callback);
+            send_wr.send_flags = IBV_SEND_SIGNALED;
+            send_wr.wr.rdma.remote_addr =
+                static_cast<uint64_t>(region.addr + (offset - region.prefix_len));
+            send_wr.wr.rdma.rkey = region.rkey;
+
+            {
+                std::lock_guard<std::mutex> post_lk(post_mutex_);
+                qp_->post_send(send_wr, bad_send_wr);
+            }
+            callback_owned_by_caller = false;
+
+            std::unique_lock<std::mutex> lk(state.mutex);
+            state.cv.wait(lk, [&state] { return state.done; });
+            if (state.exception) {
+                std::rethrow_exception(state.exception);
+            }
+        } catch (...) {
+            if (callback_owned_by_caller) {
+                rdmapp::executor::destroy_callback(callback);
+            }
+            release_send_wrs(1);
+            throw;
+        }
+
+        release_send_wrs(1);
+        return 1;
+    }
 
     std::vector<rdma_chunk> make_chunks(
         uint64_t offset,
@@ -711,20 +819,35 @@ private:
 // ====================================
 class RdmaEndpoint {
 public:
-    explicit RdmaEndpoint(int ib_port = 1, int device_num = 1) {
+    explicit RdmaEndpoint(int ib_port = 1,
+                          int device_num = 1,
+                          uint32_t io_workers = 1,
+                          size_t cq_batch_size = 16) {
+        io_workers = std::max<uint32_t>(io_workers, 1);
+        cq_batch_size = std::max<size_t>(cq_batch_size, 1);
+
         device_ = std::make_shared<rdmapp::device>(device_num, ib_port);
         pd_     = std::make_shared<rdmapp::pd>(device_);
         cq_     = std::make_shared<rdmapp::cq>(device_);
 
-        io_ctx_   = std::make_shared<asio::io_context>(4);
+        io_ctx_   = std::make_shared<asio::io_context>(io_workers);
         executor_ = std::make_shared<rdmapp::executor>(io_ctx_);
         cq_poller_ =
-            std::make_shared<rdmapp::cq_poller>(cq_, executor_);
+            std::make_shared<rdmapp::cq_poller>(cq_, executor_, cq_batch_size);
 
-        worker_ = std::jthread([this]() {
-            auto guard = asio::make_work_guard(*io_ctx_);
-            io_ctx_->run();
-        });
+        workers_.reserve(io_workers);
+        for (uint32_t worker_id = 0; worker_id < io_workers; ++worker_id) {
+            workers_.emplace_back([this]() {
+                auto guard = asio::make_work_guard(*io_ctx_);
+                io_ctx_->run();
+            });
+        }
+    }
+
+    ~RdmaEndpoint() {
+        if (io_ctx_) {
+            io_ctx_->stop();
+        }
     }
 
     std::shared_ptr<RdmaSession> connect(const std::string& host,
@@ -771,5 +894,5 @@ private:
     std::shared_ptr<asio::io_context> io_ctx_;
     std::shared_ptr<rdmapp::executor> executor_;
     std::shared_ptr<rdmapp::cq_poller> cq_poller_;
-    std::jthread worker_;
+    std::vector<std::jthread> workers_;
 };
