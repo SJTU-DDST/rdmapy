@@ -132,7 +132,6 @@ PYBIND11_MODULE(rdma_py, m) {
                 std::uint64_t tensor_offset_bytes,
                 std::uint64_t chunk_bytes,
                 std::uint32_t max_inflight,
-                std::uint64_t pace_us,
                 bool debug) {
                  auto span = tensor_span(
                      tensor, py_nbytes, tensor_offset_bytes,
@@ -169,6 +168,7 @@ PYBIND11_MODULE(rdma_py, m) {
                 std::uint64_t tensor_offset_bytes,
                 std::uint64_t chunk_bytes,
                 std::uint32_t max_inflight,
+                std::uint64_t pace_us,
                 bool debug) {
                  auto span = tensor_span(
                      tensor, py_nbytes, tensor_offset_bytes,
