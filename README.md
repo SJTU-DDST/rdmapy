@@ -245,9 +245,11 @@ CUDA Toolkit 可被 CMake 找到时，测试程序支持 `--memory cuda`，直�
 
 输出固定为 `threads,avg_us`。每个 `threads=N` 的每个 trial 都会重新
 创建 N 个 endpoint/CQ/QP，然后执行 `warmup + repeats` 次 READ，最终把
-所有 trial 的 READ 延迟取平均。计时范围是 C++ 侧 `post_send` 到
-completion callback 唤醒后的耗时，避免 Python 循环、GIL、PyTorch
-tensor 调用等 per-request 开销。
+所有 trial 的 READ 延迟取平均。默认 `--completion-mode raw-poll`，连接
+和预热后会关闭后台 CQ poller，正式计时阶段由发起 READ 的 worker 线程
+直接 `post_send` 并 busy-poll 自己的 CQ；计时范围是 `post_send` 到
+poll 到 completion 的耗时。可以用 `--completion-mode callback` 对比旧的
+callback/executor/condition_variable 路径开销。
 
 更详细的 GDR 说明见 [`GDR_USAGE.md`](GDR_USAGE.md)。
 

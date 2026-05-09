@@ -262,6 +262,8 @@ public:
   void post_send(struct ibv_send_wr const &send_wr,
                  struct ibv_send_wr *&bad_send_wr);
 
+  bool poll_send_cq(struct ibv_wc &wc);
+
   /**
    * @brief This function is used to post a recv work request to the Queue Pair.
    * It will be posted to either RQ or SRQ depending on whether or not SRQ is

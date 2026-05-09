@@ -194,6 +194,10 @@ void qp::post_send(struct ibv_send_wr const &send_wr,
            "failed to post send");
 }
 
+bool qp::poll_send_cq(struct ibv_wc &wc) {
+  return send_cq_->poll(wc);
+}
+
 void qp::post_recv(struct ibv_recv_wr const &recv_wr,
                    struct ibv_recv_wr *&bad_recv_wr) const {
   (this->*(post_recv_fn))(recv_wr, bad_recv_wr);

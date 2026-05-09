@@ -65,6 +65,7 @@ struct Options {
     bool verbose = false;
     bool debug = false;
     std::string rdma_log_level = "warn";
+    std::string completion_mode = "raw-poll";
 };
 
 [[noreturn]] void usage_error(const std::string& message) {
@@ -196,6 +197,7 @@ void print_usage(const char* prog) {
         << "  --endpoint-per-thread       default; one endpoint/CQ/QP per worker\n"
         << "  --verbose                   accepted for compatibility; output remains avg only\n"
         << "  --debug\n"
+        << "  --completion-mode MODE      raw-poll|callback, default: raw-poll\n"
         << "  --rdma-log-level LEVEL      trace/debug/info/warn/error/critical/off\n";
 }
 
@@ -299,6 +301,8 @@ Options parse_args(int argc, char* argv[]) {
             opts.verbose = true;
         } else if (arg == "--debug") {
             opts.debug = true;
+        } else if (arg == "--completion-mode") {
+            opts.completion_mode = lower_copy(take_value(i, argc, argv, arg));
         } else if (arg == "--rdma-log-level") {
             opts.rdma_log_level = lower_copy(take_value(i, argc, argv, arg));
         } else {
@@ -332,6 +336,10 @@ Options parse_args(int argc, char* argv[]) {
     }
     if (opts.prompt_stride == 0) {
         usage_error("--prompt-stride must be positive");
+    }
+    if (opts.completion_mode != "raw-poll" &&
+        opts.completion_mode != "callback") {
+        usage_error("--completion-mode must be raw-poll or callback");
     }
     return opts;
 }
@@ -531,6 +539,9 @@ public:
         for (auto& worker : workers_) {
             prime_worker(worker);
         }
+        if (opts_.completion_mode == "raw-poll") {
+            stop_cq_pollers();
+        }
     }
 
     std::vector<double> measure_threads(int threads) {
@@ -578,16 +589,30 @@ public:
                             }
                         }
 
-                        double latency_us =
-                            worker.session->read_into_transfer_latency_us(
-                                worker.base_offset,
-                                worker.buffer->addr(),
-                                opts_.prompt_bytes,
-                                opts_.prompt_bytes,
-                                nullptr,
-                                worker.buffer->length(),
-                                1,
-                                opts_.debug);
+                        double latency_us = 0.0;
+                        if (opts_.completion_mode == "raw-poll") {
+                            latency_us =
+                                worker.session->read_into_transfer_latency_us_raw_poll(
+                                    worker.base_offset,
+                                    worker.buffer->addr(),
+                                    opts_.prompt_bytes,
+                                    opts_.prompt_bytes,
+                                    nullptr,
+                                    worker.buffer->length(),
+                                    1,
+                                    opts_.debug);
+                        } else {
+                            latency_us =
+                                worker.session->read_into_transfer_latency_us(
+                                    worker.base_offset,
+                                    worker.buffer->addr(),
+                                    opts_.prompt_bytes,
+                                    opts_.prompt_bytes,
+                                    nullptr,
+                                    worker.buffer->length(),
+                                    1,
+                                    opts_.debug);
+                        }
                         if (iteration >= opts_.warmup) {
                             latencies.push_back(latency_us);
                         }
@@ -662,6 +687,15 @@ private:
             worker.buffer->length(),
             1,
             opts_.debug);
+    }
+
+    void stop_cq_pollers() {
+        if (shared_endpoint_) {
+            shared_endpoint_->stop_cq_poller();
+        }
+        for (auto& endpoint : endpoints_) {
+            endpoint->stop_cq_poller();
+        }
     }
 
     const Options& opts_;

@@ -359,6 +359,61 @@ public:
         return transfer_us;
     }
 
+    double read_into_transfer_latency_us_raw_poll(
+                   uint64_t offset,
+                   std::uintptr_t local_addr,
+                   uint64_t length,
+                   uint64_t chunk_bytes = 64ull * 1024 * 1024,
+                   std::shared_ptr<void> owner = nullptr,
+                   uint64_t register_length = 0,
+                   uint32_t max_inflight = 16,
+                   bool debug = false) {
+        (void)max_inflight;
+        (void)debug;
+        if (length > total_len_ || offset > total_len_ - length) {
+            throw std::runtime_error("read_into_transfer_latency_us_raw_poll out of range");
+        }
+        if (length > 0 && local_addr == 0) {
+            throw std::runtime_error("read_into_transfer_latency_us_raw_poll got null local address");
+        }
+        if (chunk_bytes == 0) {
+            throw std::runtime_error("read_into_transfer_latency_us_raw_poll chunk_bytes must be > 0");
+        }
+        if (length == 0) {
+            return 0.0;
+        }
+        if (register_length == 0) {
+            register_length = length;
+        }
+        if (register_length < length) {
+            throw std::runtime_error(
+                "read_into_transfer_latency_us_raw_poll register_length is smaller than length");
+        }
+
+        std::shared_ptr<rdmapp::local_mr> local_mr;
+        {
+            std::lock_guard<std::mutex> lk(mutex_);
+            local_mr = get_cached_local_mr(
+                local_addr, register_length, std::move(owner));
+        }
+
+        const remote_mr_info* single_region =
+            length <= chunk_bytes ? find_region_for_range(offset, length) : nullptr;
+        if (single_region == nullptr ||
+            length > std::numeric_limits<uint32_t>::max()) {
+            throw std::runtime_error(
+                "raw-poll latency path supports one in-region RDMA READ only");
+        }
+
+        return post_single_rdma_raw_poll(
+            IBV_WR_RDMA_READ,
+            *single_region,
+            offset,
+            local_addr,
+            static_cast<uint32_t>(length),
+            local_mr);
+    }
+
 
         // 同步 write，支持跨多个 MR
     void write(uint64_t offset, const uint8_t* data, size_t len) {
@@ -700,6 +755,46 @@ private:
         return 1;
     }
 
+    double post_single_rdma_raw_poll(
+        enum ibv_wr_opcode opcode,
+        const remote_mr_info& region,
+        uint64_t offset,
+        std::uintptr_t local_addr,
+        uint32_t length,
+        std::shared_ptr<rdmapp::local_mr> local_mr) {
+        struct ibv_sge sge = {};
+        sge.addr = static_cast<uint64_t>(local_addr);
+        sge.length = length;
+        sge.lkey = local_mr->lkey();
+
+        struct ibv_send_wr send_wr = {};
+        struct ibv_send_wr *bad_send_wr = nullptr;
+        send_wr.opcode = opcode;
+        send_wr.next = nullptr;
+        send_wr.num_sge = 1;
+        send_wr.sg_list = &sge;
+        send_wr.wr_id = 1;
+        send_wr.send_flags = IBV_SEND_SIGNALED;
+        send_wr.wr.rdma.remote_addr =
+            static_cast<uint64_t>(region.addr + (offset - region.prefix_len));
+        send_wr.wr.rdma.rkey = region.rkey;
+
+        struct ibv_wc wc = {};
+        auto t0 = std::chrono::steady_clock::now();
+        qp_->post_send(send_wr, bad_send_wr);
+        while (!qp_->poll_send_cq(wc)) {
+        }
+        auto t1 = std::chrono::steady_clock::now();
+
+        if (wc.status != IBV_WC_SUCCESS) {
+            throw std::runtime_error(
+                std::string("raw-poll RDMA failed: ") +
+                ibv_wc_status_str(wc.status));
+        }
+
+        return std::chrono::duration<double, std::micro>(t1 - t0).count();
+    }
+
     std::vector<rdma_chunk> make_chunks(
         uint64_t offset,
         uint64_t length,
@@ -946,6 +1041,10 @@ public:
         if (io_ctx_) {
             io_ctx_->stop();
         }
+    }
+
+    void stop_cq_poller() {
+        cq_poller_.reset();
     }
 
     std::shared_ptr<RdmaSession> connect(const std::string& host,
