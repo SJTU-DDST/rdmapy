@@ -236,7 +236,8 @@ CUDA Toolkit 可被 CMake 找到时，测试程序支持 `--memory cuda`，直�
   --max-threads 16 \
   --repeats 5000 \
   --warmup 500 \
-  --trials 5
+  --trials 5 \
+  --cpu-list 0-15
 ```
 
 注意：bash 续行符 `\` 必须是这一行最后一个字符，后面不能有空格。
@@ -250,6 +251,10 @@ CUDA Toolkit 可被 CMake 找到时，测试程序支持 `--memory cuda`，直�
 直接 `post_send` 并 busy-poll 自己的 CQ；计时范围是 `post_send` 到
 poll 到 completion 的耗时。可以用 `--completion-mode callback` 对比旧的
 callback/executor/condition_variable 路径开销。
+
+raw-poll 对 CPU 调度非常敏感。`--cpu-list` 会把第 N 个 worker 固定到列表
+中的第 N 个 CPU，例如 `--cpu-list 0-7,16-23`。实际测试时应优先选择和
+RDMA 网卡、GPU 在同一个 NUMA node 上的物理核，避免使用 SMT sibling。
 
 更详细的 GDR 说明见 [`GDR_USAGE.md`](GDR_USAGE.md)。
 

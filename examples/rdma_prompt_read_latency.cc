@@ -7,6 +7,7 @@
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <iomanip>
 #include <iostream>
@@ -21,6 +22,11 @@
 #include <vector>
 
 #include <spdlog/spdlog.h>
+
+#ifdef __linux__
+#include <pthread.h>
+#include <sched.h>
+#endif
 
 #ifdef RDMAPY_HAS_CUDA
 #include <cuda_runtime_api.h>
@@ -61,6 +67,7 @@ struct Options {
     int io_workers = 1;
     std::size_t cq_batch_size = 16;
     std::size_t mr_cache_limit = 16;
+    std::vector<int> cpu_list;
     bool endpoint_per_thread = true;
     bool verbose = false;
     bool debug = false;
@@ -167,6 +174,53 @@ std::string take_value(int& index, int argc, char* argv[], const std::string& fl
     return argv[++index];
 }
 
+int parse_cpu_id(const std::string& text) {
+    return static_cast<int>(
+        parse_ll("CPU id", text, 0, std::numeric_limits<int>::max()));
+}
+
+std::vector<int> parse_cpu_list(const std::string& text) {
+    if (text.empty()) {
+        usage_error("--cpu-list cannot be empty");
+    }
+
+    std::vector<int> cpus;
+    std::size_t start = 0;
+    while (start <= text.size()) {
+        std::size_t comma = text.find(',', start);
+        std::string item = text.substr(
+            start,
+            comma == std::string::npos ? std::string::npos : comma - start);
+        if (item.empty()) {
+            usage_error("empty item in --cpu-list");
+        }
+
+        std::size_t dash = item.find('-');
+        if (dash == std::string::npos) {
+            cpus.push_back(parse_cpu_id(item));
+        } else {
+            if (item.find('-', dash + 1) != std::string::npos) {
+                usage_error("invalid CPU range in --cpu-list: " + item);
+            }
+            int first = parse_cpu_id(item.substr(0, dash));
+            int last = parse_cpu_id(item.substr(dash + 1));
+            if (first > last) {
+                usage_error("descending CPU range in --cpu-list: " + item);
+            }
+            for (int cpu = first; cpu <= last; ++cpu) {
+                cpus.push_back(cpu);
+            }
+        }
+
+        if (comma == std::string::npos) {
+            break;
+        }
+        start = comma + 1;
+    }
+
+    return cpus;
+}
+
 void print_usage(const char* prog) {
     std::cout
         << "Usage:\n"
@@ -194,6 +248,7 @@ void print_usage(const char* prog) {
         << "  --io-workers N              default: 1\n"
         << "  --cq-batch-size N           default: 16\n"
         << "  --mr-cache-limit N          default: 16, 0 disables cache\n"
+        << "  --cpu-list LIST             pin workers, e.g. 0-7,16-23\n"
         << "  --endpoint-per-thread       default; one endpoint/CQ/QP per worker\n"
         << "  --verbose                   accepted for compatibility; output remains avg only\n"
         << "  --debug\n"
@@ -286,6 +341,8 @@ Options parse_args(int argc, char* argv[]) {
             opts.mr_cache_limit = static_cast<std::size_t>(
                 parse_ll(arg, take_value(i, argc, argv, arg), 0,
                          std::numeric_limits<int>::max()));
+        } else if (arg == "--cpu-list") {
+            opts.cpu_list = parse_cpu_list(take_value(i, argc, argv, arg));
         } else if (arg == "--endpoint-per-thread") {
             opts.endpoint_per_thread = true;
         } else if (arg == "--shared-endpoint") {
@@ -340,6 +397,10 @@ Options parse_args(int argc, char* argv[]) {
     if (opts.completion_mode != "raw-poll" &&
         opts.completion_mode != "callback") {
         usage_error("--completion-mode must be raw-poll or callback");
+    }
+    if (!opts.cpu_list.empty() &&
+        static_cast<int>(opts.cpu_list.size()) < opts.max_threads) {
+        usage_error("--cpu-list must contain at least --max-threads CPUs");
     }
     return opts;
 }
@@ -448,6 +509,23 @@ std::unique_ptr<LocalBuffer> make_buffer(const Options& opts) {
     throw std::runtime_error(
         "this binary was built without CUDA support; rerun with --memory host "
         "or rebuild after CMake can find CUDAToolkit");
+#endif
+}
+
+void pin_current_thread_to_cpu(int cpu) {
+#ifdef __linux__
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(cpu, &set);
+    int rc = pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+    if (rc != 0) {
+        throw std::runtime_error(
+            "failed to pin worker to CPU " + std::to_string(cpu) +
+            ": " + std::strerror(rc));
+    }
+#else
+    (void)cpu;
+    throw std::runtime_error("--cpu-list is only supported on Linux");
 #endif
 }
 
@@ -561,6 +639,10 @@ public:
         for (int worker_id = 0; worker_id < threads; ++worker_id) {
             thread_pool.emplace_back([&, worker_id] {
                 try {
+                    if (!opts_.cpu_list.empty()) {
+                        pin_current_thread_to_cpu(
+                            opts_.cpu_list[static_cast<std::size_t>(worker_id)]);
+                    }
                     gate.arrive_and_wait();
 
                     auto& worker = workers_[static_cast<std::size_t>(worker_id)];
