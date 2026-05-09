@@ -11,6 +11,7 @@
 
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
+#include <spdlog/spdlog.h>
 
 #include "rdma_session.hpp"
 
@@ -94,10 +95,37 @@ std::shared_ptr<void> keep_python_object_alive(py::object obj) {
         });
 }
 
+void set_spdlog_level_from_name(const std::string& level) {
+    if (level == "trace") {
+        spdlog::set_level(spdlog::level::trace);
+    } else if (level == "debug") {
+        spdlog::set_level(spdlog::level::debug);
+    } else if (level == "info") {
+        spdlog::set_level(spdlog::level::info);
+    } else if (level == "warn" || level == "warning") {
+        spdlog::set_level(spdlog::level::warn);
+    } else if (level == "error") {
+        spdlog::set_level(spdlog::level::err);
+    } else if (level == "critical") {
+        spdlog::set_level(spdlog::level::critical);
+    } else if (level == "off") {
+        spdlog::set_level(spdlog::level::off);
+    } else {
+        throw std::runtime_error("unsupported rdma log level: " + level);
+    }
+}
+
 } // namespace
 
 PYBIND11_MODULE(rdma_py, m) {
     m.doc() = "RDMA KV-cache bindings using rdmapp";
+    set_spdlog_level_from_name("warn");
+
+    m.def("set_log_level",
+          [](const std::string& level) {
+              set_spdlog_level_from_name(level);
+          },
+          py::arg("level"));
 
     py::class_<RdmaSession, std::shared_ptr<RdmaSession>>(m, "Session")
         .def("read",
@@ -195,8 +223,7 @@ PYBIND11_MODULE(rdma_py, m) {
                                  next_issue = now;
                              }
                          }
-                         auto t0 = std::chrono::steady_clock::now();
-                         sess.read_into(
+                         double latency_us = sess.read_into_transfer_latency_us(
                              offset,
                              span.addr,
                              span.nbytes,
@@ -205,11 +232,8 @@ PYBIND11_MODULE(rdma_py, m) {
                              span.register_nbytes,
                              max_inflight,
                              debug);
-                         auto t1 = std::chrono::steady_clock::now();
                          if (iteration >= warmup) {
-                             latencies_us.push_back(
-                                 std::chrono::duration<double, std::micro>(
-                                     t1 - t0).count());
+                             latencies_us.push_back(latency_us);
                          }
                      }
                  }

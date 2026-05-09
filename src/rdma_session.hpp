@@ -25,6 +25,7 @@
 #include <rdmapp/mr.h>
 #include <rdmapp/qp.h>
 #include <rdmapp/executor.h>
+#include <spdlog/spdlog.h>
 
 #include "qp_connector.h"
 
@@ -87,8 +88,9 @@ public:
         }
         total_len_ = prefix;
 
-        std::cerr << "[RdmaSession] total_len=" << total_len_
-                  << " num_regions=" << regions_.size() << std::endl;
+        spdlog::debug("[RdmaSession] total_len={} num_regions={}",
+                      total_len_,
+                      regions_.size());
     }
 
     size_t mr_cache_size() {
@@ -268,6 +270,93 @@ public:
             t0,
             hits_before,
             misses_before);
+    }
+
+    // Same operation as read_into(), but returns the measured submit-to-complete
+    // latency in microseconds. Setup work such as MR cache lookup and region
+    // lookup is intentionally done before the timer starts.
+    double read_into_transfer_latency_us(
+                   uint64_t offset,
+                   std::uintptr_t local_addr,
+                   uint64_t length,
+                   uint64_t chunk_bytes = 64ull * 1024 * 1024,
+                   std::shared_ptr<void> owner = nullptr,
+                   uint64_t register_length = 0,
+                   uint32_t max_inflight = 16,
+                   bool debug = false) {
+        if (length > total_len_ || offset > total_len_ - length) {
+            throw std::runtime_error("read_into_transfer_latency_us out of range");
+        }
+        if (length > 0 && local_addr == 0) {
+            throw std::runtime_error("read_into_transfer_latency_us got null local address");
+        }
+        if (chunk_bytes == 0) {
+            throw std::runtime_error("read_into_transfer_latency_us chunk_bytes must be > 0");
+        }
+        if (length == 0) {
+            return 0.0;
+        }
+        if (register_length == 0) {
+            register_length = length;
+        }
+        if (register_length < length) {
+            throw std::runtime_error(
+                "read_into_transfer_latency_us register_length is smaller than length");
+        }
+
+        uint64_t hits_before = 0;
+        uint64_t misses_before = 0;
+        std::shared_ptr<rdmapp::local_mr> local_mr;
+        {
+            std::lock_guard<std::mutex> lk(mutex_);
+            hits_before = mr_cache_hits_;
+            misses_before = mr_cache_misses_;
+            local_mr = get_cached_local_mr(
+                local_addr, register_length, std::move(owner));
+        }
+
+        auto debug_t0 = std::chrono::steady_clock::now();
+        double transfer_us = 0.0;
+        size_t chunks = 0;
+        const remote_mr_info* single_region =
+            length <= chunk_bytes ? find_region_for_range(offset, length) : nullptr;
+        if (single_region != nullptr &&
+            length <= std::numeric_limits<uint32_t>::max()) {
+            chunks = post_single_rdma(
+                IBV_WR_RDMA_READ,
+                *single_region,
+                offset,
+                local_addr,
+                static_cast<uint32_t>(length),
+                local_mr,
+                &transfer_us);
+        } else {
+            auto t0 = std::chrono::steady_clock::now();
+            chunks = post_windowed_rdma(
+                IBV_WR_RDMA_READ,
+                offset,
+                local_addr,
+                length,
+                chunk_bytes,
+                local_mr,
+                max_inflight
+            );
+            auto t1 = std::chrono::steady_clock::now();
+            transfer_us = std::chrono::duration<double, std::micro>(
+                t1 - t0).count();
+        }
+        debug_report(
+            debug,
+            "read_into_transfer_latency_us",
+            offset,
+            length,
+            chunk_bytes,
+            max_inflight,
+            chunks,
+            debug_t0,
+            hits_before,
+            misses_before);
+        return transfer_us;
     }
 
 
@@ -540,7 +629,8 @@ private:
         uint64_t offset,
         std::uintptr_t local_addr,
         uint32_t length,
-        std::shared_ptr<rdmapp::local_mr> local_mr) {
+        std::shared_ptr<rdmapp::local_mr> local_mr,
+        double* submit_to_complete_us = nullptr) {
         batch_state state;
         reserve_send_wrs(1);
 
@@ -561,6 +651,7 @@ private:
                 });
         bool callback_owned_by_caller = true;
 
+        auto submit_t0 = std::chrono::steady_clock::time_point{};
         try {
             struct ibv_sge sge = {};
             sge.addr = static_cast<uint64_t>(local_addr);
@@ -581,12 +672,19 @@ private:
 
             {
                 std::lock_guard<std::mutex> post_lk(post_mutex_);
+                submit_t0 = std::chrono::steady_clock::now();
                 qp_->post_send(send_wr, bad_send_wr);
             }
             callback_owned_by_caller = false;
 
             std::unique_lock<std::mutex> lk(state.mutex);
             state.cv.wait(lk, [&state] { return state.done; });
+            if (submit_to_complete_us != nullptr) {
+                auto t1 = std::chrono::steady_clock::now();
+                *submit_to_complete_us =
+                    std::chrono::duration<double, std::micro>(
+                        t1 - submit_t0).count();
+            }
             if (state.exception) {
                 std::rethrow_exception(state.exception);
             }

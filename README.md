@@ -200,6 +200,51 @@ python3 examples/gdr_tensor_bench.py \
   --max-inflight 1,4,8,16
 ```
 
+## C++ Prompt READ 延迟测试
+
+顶层 CMake 现在也会构建一个不经过 Python/PyTorch 调度循环的 C++ 延迟测试：
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build build -j --target rdma_prompt_read_latency
+```
+
+如果这台机器只需要 C++ 测试、不需要 Python extension，可以跳过
+Python/pybind11：
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DRDMAPY_BUILD_PYTHON=OFF
+cmake --build build -j --target rdma_prompt_read_latency
+```
+
+CUDA Toolkit 可被 CMake 找到时，测试程序支持 `--memory cuda`，直接用
+`cudaMalloc` 出来的本地 buffer 做 GPUDirect RDMA READ；否则仍可用
+`--memory host` 做 host buffer 延迟测试。
+
+示例：
+
+```bash
+./build/rdma_prompt_read_latency \
+  --host <server-ip> \
+  --port 2333 \
+  --ib-device 0 \
+  --ib-port 1 \
+  --memory cuda \
+  --cuda-device 0 \
+  --prompt-bytes 128 \
+  --min-threads 1 \
+  --max-threads 16 \
+  --repeats 100 \
+  --warmup 10 \
+  --verbose
+```
+
+输出 CSV 字段和 `Sequoia/tests/rdma_prompt_read_latency.py` 基本对齐：
+`threads,avg_us`，加 `--verbose` 后输出
+`threads,avg_us,p50_us,p95_us,p99_us,trial_cv_pct`。计时范围是 C++ 侧
+`post_send` 到 completion callback 唤醒后的耗时，避免 Python 循环、
+GIL、PyTorch tensor 调用等 per-request 开销。
+
 更详细的 GDR 说明见 [`GDR_USAGE.md`](GDR_USAGE.md)。
 
 ## 常见问题

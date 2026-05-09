@@ -27,6 +27,9 @@ set(RDMAPP_BUILD_NORTTI OFF CACHE BOOL "" FORCE)
 set(RDMAPP_BUILD_PIC ON CACHE BOOL "" FORCE)
 add_subdirectory(${RDMAPP_DIR} ${CMAKE_CURRENT_BINARY_DIR}/rdmapp-build)
 
+option(RDMAPY_BUILD_PYTHON "Build Python extension module" ON)
+
+if(RDMAPY_BUILD_PYTHON)
 # ===== 找 Python / pybind11 =====
 find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
 execute_process(
@@ -62,3 +65,37 @@ target_link_libraries(rdma_py
     PRIVATE
     rdmapp_qp_helpers
 )
+endif()
+
+# ===== 构建纯 C++ 延迟测试 =====
+option(RDMAPY_BUILD_CXX_BENCHES "Build standalone C++ RDMA benchmark clients" ON)
+
+if(RDMAPY_BUILD_CXX_BENCHES)
+    find_package(CUDAToolkit QUIET)
+
+    add_executable(rdma_prompt_read_latency
+        examples/rdma_prompt_read_latency.cc
+        src/rdma_session.hpp
+    )
+
+    target_compile_features(rdma_prompt_read_latency PRIVATE cxx_std_20)
+
+    target_include_directories(rdma_prompt_read_latency
+        PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${RDMAPP_DIR}/examples/include
+    )
+
+    target_link_libraries(rdma_prompt_read_latency
+        PRIVATE
+        rdmapp_qp_helpers
+    )
+
+    if(CUDAToolkit_FOUND)
+        message(STATUS "CUDAToolkit found: enabling CUDA buffer mode for rdma_prompt_read_latency")
+        target_compile_definitions(rdma_prompt_read_latency PRIVATE RDMAPY_HAS_CUDA=1)
+        target_link_libraries(rdma_prompt_read_latency PRIVATE CUDA::cudart)
+    else()
+        message(STATUS "CUDAToolkit not found: rdma_prompt_read_latency will support --memory host only")
+    endif()
+endif()

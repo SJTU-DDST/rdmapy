@@ -1,0 +1,749 @@
+#include "rdma_session.hpp"
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <condition_variable>
+#include <cctype>
+#include <cstdint>
+#include <cstdlib>
+#include <exception>
+#include <iomanip>
+#include <iostream>
+#include <limits>
+#include <memory>
+#include <mutex>
+#include <numeric>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <utility>
+#include <vector>
+
+#include <spdlog/spdlog.h>
+
+#ifdef RDMAPY_HAS_CUDA
+#include <cuda_runtime_api.h>
+#endif
+
+namespace {
+
+constexpr std::uint64_t kKiB = 1024ull;
+constexpr std::uint64_t kMiB = 1024ull * kKiB;
+constexpr std::uint64_t kGiB = 1024ull * kMiB;
+
+#ifdef RDMAPY_HAS_CUDA
+constexpr const char* kDefaultMemory = "cuda";
+#else
+constexpr const char* kDefaultMemory = "host";
+#endif
+
+struct Options {
+    std::string host = "127.0.0.1";
+    std::uint16_t port = 2333;
+    int ib_port = 1;
+    int ib_device = 1;
+    int cuda_device = 0;
+    std::string memory = kDefaultMemory;
+    std::uint64_t offset = 0;
+    std::uint64_t prompt_stride = 4 * kKiB;
+    int prompt_tokens = 32;
+    int token_bytes = 4;
+    bool prompt_bytes_set = false;
+    std::uint64_t prompt_bytes = 0;
+    int min_threads = 1;
+    int max_threads = 16;
+    int repeats = 100;
+    int warmup = 10;
+    int trials = 1;
+    std::int64_t pace_us = 0;
+    std::int64_t stagger_us = 0;
+    int io_workers = 1;
+    std::size_t cq_batch_size = 16;
+    std::size_t mr_cache_limit = 16;
+    bool endpoint_per_thread = true;
+    bool recreate_per_thread_count = true;
+    bool verbose = false;
+    bool debug = false;
+    std::string rdma_log_level = "warn";
+};
+
+[[noreturn]] void usage_error(const std::string& message) {
+    throw std::runtime_error("argument error: " + message);
+}
+
+std::string lower_copy(std::string value) {
+    std::transform(
+        value.begin(),
+        value.end(),
+        value.begin(),
+        [](unsigned char ch) {
+            return static_cast<char>(std::tolower(ch));
+        });
+    return value;
+}
+
+std::uint64_t parse_size(const std::string& text) {
+    std::string value = lower_copy(text);
+    if (value.empty()) {
+        usage_error("empty size");
+    }
+
+    std::uint64_t scale = 1;
+    auto strip_suffix = [&](const std::string& suffix, std::uint64_t suffix_scale) {
+        if (value.size() >= suffix.size() &&
+            value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0) {
+            value.resize(value.size() - suffix.size());
+            scale = suffix_scale;
+            return true;
+        }
+        return false;
+    };
+
+    if (!strip_suffix("gb", kGiB) &&
+        !strip_suffix("g", kGiB) &&
+        !strip_suffix("mb", kMiB) &&
+        !strip_suffix("m", kMiB) &&
+        !strip_suffix("kb", kKiB)) {
+        strip_suffix("k", kKiB);
+    }
+
+    try {
+        std::size_t consumed = 0;
+        long double parsed = std::stold(value, &consumed);
+        if (consumed != value.size()) {
+            usage_error("invalid size: " + text);
+        }
+        if (parsed < 0.0L) {
+            usage_error("size must be non-negative: " + text);
+        }
+        long double bytes = parsed * static_cast<long double>(scale);
+        if (bytes > static_cast<long double>(std::numeric_limits<std::uint64_t>::max())) {
+            usage_error("size overflows uint64: " + text);
+        }
+        return static_cast<std::uint64_t>(bytes);
+    } catch (const std::invalid_argument&) {
+        usage_error("invalid size: " + text);
+    } catch (const std::out_of_range&) {
+        usage_error("size out of range: " + text);
+    }
+}
+
+long long parse_ll(const std::string& name,
+                   const std::string& value,
+                   long long min_value,
+                   long long max_value) {
+    try {
+        std::size_t consumed = 0;
+        long long parsed = std::stoll(value, &consumed);
+        if (consumed != value.size()) {
+            usage_error("invalid " + name + ": " + value);
+        }
+        if (parsed < min_value || parsed > max_value) {
+            usage_error(name + " outside allowed range: " + value);
+        }
+        return parsed;
+    } catch (const std::invalid_argument&) {
+        usage_error("invalid " + name + ": " + value);
+    } catch (const std::out_of_range&) {
+        usage_error(name + " out of range: " + value);
+    }
+}
+
+std::string take_value(int& index, int argc, char* argv[], const std::string& flag) {
+    if (index + 1 >= argc) {
+        usage_error(flag + " requires a value");
+    }
+    return argv[++index];
+}
+
+void print_usage(const char* prog) {
+    std::cout
+        << "Usage:\n"
+        << "  " << prog << " [options]\n\n"
+        << "Core options:\n"
+        << "  --host HOST                 default: 127.0.0.1\n"
+        << "  --port PORT                 default: 2333\n"
+        << "  --ib-port PORT              default: 1\n"
+        << "  --ib-device DEVICE          default: 1\n"
+        << "  --memory cuda|host          default: " << kDefaultMemory << "\n"
+        << "  --cuda-device DEVICE        default: 0\n"
+        << "  --offset BYTES              default: 0\n"
+        << "  --prompt-stride BYTES       default: 4k\n"
+        << "  --prompt-tokens N           default: 32\n"
+        << "  --token-bytes N             default: 4\n"
+        << "  --prompt-bytes BYTES        overrides tokens * token-bytes\n\n"
+        << "Benchmark options:\n"
+        << "  --min-threads N             default: 1\n"
+        << "  --max-threads N             default: 16\n"
+        << "  --repeats N                 default: 100\n"
+        << "  --warmup N                  default: 10\n"
+        << "  --trials N                  default: 1\n"
+        << "  --pace-us N                 default: 0\n"
+        << "  --stagger-us N              default: 0\n"
+        << "  --io-workers N              default: 1\n"
+        << "  --cq-batch-size N           default: 16\n"
+        << "  --mr-cache-limit N          default: 16, 0 disables cache\n"
+        << "  --endpoint-per-thread       default\n"
+        << "  --shared-endpoint\n"
+        << "  --recreate-per-thread-count default\n"
+        << "  --reuse-max-threads\n"
+        << "  --verbose\n"
+        << "  --debug\n"
+        << "  --rdma-log-level LEVEL      trace/debug/info/warn/error/critical/off\n";
+}
+
+Options parse_args(int argc, char* argv[]) {
+    Options opts;
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "-h" || arg == "--help") {
+            print_usage(argv[0]);
+            std::exit(0);
+        } else if (arg == "--host") {
+            opts.host = take_value(i, argc, argv, arg);
+        } else if (arg == "--port") {
+            opts.port = static_cast<std::uint16_t>(
+                parse_ll(arg, take_value(i, argc, argv, arg), 1, 65535));
+        } else if (arg == "--ib-port") {
+            opts.ib_port = static_cast<int>(
+                parse_ll(arg, take_value(i, argc, argv, arg), 1,
+                         std::numeric_limits<int>::max()));
+        } else if (arg == "--ib-device") {
+            opts.ib_device = static_cast<int>(
+                parse_ll(arg, take_value(i, argc, argv, arg), 0,
+                         std::numeric_limits<int>::max()));
+        } else if (arg == "--memory") {
+            opts.memory = lower_copy(take_value(i, argc, argv, arg));
+        } else if (arg == "--cuda-device") {
+            opts.cuda_device = static_cast<int>(
+                parse_ll(arg, take_value(i, argc, argv, arg), 0,
+                         std::numeric_limits<int>::max()));
+        } else if (arg == "--offset") {
+            opts.offset = parse_size(take_value(i, argc, argv, arg));
+        } else if (arg == "--prompt-stride") {
+            opts.prompt_stride = parse_size(take_value(i, argc, argv, arg));
+        } else if (arg == "--prompt-tokens") {
+            opts.prompt_tokens = static_cast<int>(
+                parse_ll(arg, take_value(i, argc, argv, arg), 1,
+                         std::numeric_limits<int>::max()));
+        } else if (arg == "--token-bytes") {
+            opts.token_bytes = static_cast<int>(
+                parse_ll(arg, take_value(i, argc, argv, arg), 1,
+                         std::numeric_limits<int>::max()));
+        } else if (arg == "--prompt-bytes") {
+            opts.prompt_bytes = parse_size(take_value(i, argc, argv, arg));
+            opts.prompt_bytes_set = true;
+        } else if (arg == "--min-threads") {
+            opts.min_threads = static_cast<int>(
+                parse_ll(arg, take_value(i, argc, argv, arg), 1,
+                         std::numeric_limits<int>::max()));
+        } else if (arg == "--max-threads") {
+            opts.max_threads = static_cast<int>(
+                parse_ll(arg, take_value(i, argc, argv, arg), 1,
+                         std::numeric_limits<int>::max()));
+        } else if (arg == "--repeats") {
+            opts.repeats = static_cast<int>(
+                parse_ll(arg, take_value(i, argc, argv, arg), 1,
+                         std::numeric_limits<int>::max()));
+        } else if (arg == "--warmup") {
+            opts.warmup = static_cast<int>(
+                parse_ll(arg, take_value(i, argc, argv, arg), 0,
+                         std::numeric_limits<int>::max()));
+        } else if (arg == "--trials") {
+            opts.trials = static_cast<int>(
+                parse_ll(arg, take_value(i, argc, argv, arg), 1,
+                         std::numeric_limits<int>::max()));
+        } else if (arg == "--pace-us") {
+            opts.pace_us = parse_ll(arg, take_value(i, argc, argv, arg), 0,
+                                    std::numeric_limits<std::int64_t>::max());
+        } else if (arg == "--stagger-us") {
+            opts.stagger_us = parse_ll(arg, take_value(i, argc, argv, arg), 0,
+                                       std::numeric_limits<std::int64_t>::max());
+        } else if (arg == "--io-workers") {
+            opts.io_workers = static_cast<int>(
+                parse_ll(arg, take_value(i, argc, argv, arg), 1,
+                         std::numeric_limits<int>::max()));
+        } else if (arg == "--cq-batch-size") {
+            opts.cq_batch_size = static_cast<std::size_t>(
+                parse_ll(arg, take_value(i, argc, argv, arg), 1,
+                         std::numeric_limits<int>::max()));
+        } else if (arg == "--mr-cache-limit") {
+            opts.mr_cache_limit = static_cast<std::size_t>(
+                parse_ll(arg, take_value(i, argc, argv, arg), 0,
+                         std::numeric_limits<int>::max()));
+        } else if (arg == "--endpoint-per-thread") {
+            opts.endpoint_per_thread = true;
+        } else if (arg == "--shared-endpoint") {
+            opts.endpoint_per_thread = false;
+        } else if (arg == "--recreate-per-thread-count") {
+            opts.recreate_per_thread_count = true;
+        } else if (arg == "--reuse-max-threads") {
+            opts.recreate_per_thread_count = false;
+        } else if (arg == "--verbose") {
+            opts.verbose = true;
+        } else if (arg == "--debug") {
+            opts.debug = true;
+        } else if (arg == "--rdma-log-level") {
+            opts.rdma_log_level = lower_copy(take_value(i, argc, argv, arg));
+        } else {
+            usage_error("unknown argument: " + arg);
+        }
+    }
+
+    if (!opts.prompt_bytes_set) {
+        if (static_cast<std::uint64_t>(opts.prompt_tokens) >
+            std::numeric_limits<std::uint64_t>::max() /
+                static_cast<std::uint64_t>(opts.token_bytes)) {
+            usage_error("prompt_tokens * token_bytes overflows uint64");
+        }
+        opts.prompt_bytes =
+            static_cast<std::uint64_t>(opts.prompt_tokens) *
+            static_cast<std::uint64_t>(opts.token_bytes);
+    }
+
+    if (opts.memory != "cuda" && opts.memory != "host") {
+        usage_error("--memory must be cuda or host");
+    }
+    if (opts.prompt_bytes == 0) {
+        usage_error("prompt size must be positive");
+    }
+    if (opts.prompt_bytes > static_cast<std::uint64_t>(
+            std::numeric_limits<std::size_t>::max())) {
+        usage_error("prompt size exceeds size_t");
+    }
+    if (opts.min_threads > opts.max_threads) {
+        usage_error("--min-threads must be <= --max-threads");
+    }
+    if (opts.prompt_stride == 0) {
+        usage_error("--prompt-stride must be positive");
+    }
+    return opts;
+}
+
+void set_spdlog_level_from_name(const std::string& level) {
+    if (level == "trace") {
+        spdlog::set_level(spdlog::level::trace);
+    } else if (level == "debug") {
+        spdlog::set_level(spdlog::level::debug);
+    } else if (level == "info") {
+        spdlog::set_level(spdlog::level::info);
+    } else if (level == "warn" || level == "warning") {
+        spdlog::set_level(spdlog::level::warn);
+    } else if (level == "error") {
+        spdlog::set_level(spdlog::level::err);
+    } else if (level == "critical") {
+        spdlog::set_level(spdlog::level::critical);
+    } else if (level == "off") {
+        spdlog::set_level(spdlog::level::off);
+    } else {
+        usage_error("unsupported RDMA log level: " + level);
+    }
+}
+
+class LocalBuffer {
+public:
+    virtual ~LocalBuffer() = default;
+    virtual std::uintptr_t addr() const = 0;
+    virtual std::uint64_t length() const = 0;
+    virtual void activate() const {}
+};
+
+class HostBuffer final : public LocalBuffer {
+public:
+    explicit HostBuffer(std::uint64_t nbytes)
+        : bytes_(static_cast<std::size_t>(nbytes), 0) {}
+
+    std::uintptr_t addr() const override {
+        return reinterpret_cast<std::uintptr_t>(bytes_.data());
+    }
+
+    std::uint64_t length() const override {
+        return static_cast<std::uint64_t>(bytes_.size());
+    }
+
+private:
+    std::vector<std::uint8_t> bytes_;
+};
+
+#ifdef RDMAPY_HAS_CUDA
+void check_cuda(cudaError_t status, const char* what) {
+    if (status != cudaSuccess) {
+        throw std::runtime_error(
+            std::string(what) + ": " + cudaGetErrorString(status));
+    }
+}
+
+class CudaBuffer final : public LocalBuffer {
+public:
+    CudaBuffer(std::uint64_t nbytes, int device)
+        : ptr_(nullptr),
+          nbytes_(nbytes),
+          device_(device) {
+        activate();
+        check_cuda(cudaMalloc(&ptr_, static_cast<std::size_t>(nbytes_)),
+                   "cudaMalloc");
+        check_cuda(cudaMemset(ptr_, 0, static_cast<std::size_t>(nbytes_)),
+                   "cudaMemset");
+        check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize");
+    }
+
+    ~CudaBuffer() override {
+        if (ptr_ != nullptr) {
+            cudaSetDevice(device_);
+            cudaFree(ptr_);
+        }
+    }
+
+    std::uintptr_t addr() const override {
+        return reinterpret_cast<std::uintptr_t>(ptr_);
+    }
+
+    std::uint64_t length() const override {
+        return nbytes_;
+    }
+
+    void activate() const override {
+        check_cuda(cudaSetDevice(device_), "cudaSetDevice");
+    }
+
+private:
+    void* ptr_;
+    std::uint64_t nbytes_;
+    int device_;
+};
+#endif
+
+std::unique_ptr<LocalBuffer> make_buffer(const Options& opts) {
+    if (opts.memory == "host") {
+        return std::make_unique<HostBuffer>(opts.prompt_bytes);
+    }
+
+#ifdef RDMAPY_HAS_CUDA
+    return std::make_unique<CudaBuffer>(opts.prompt_bytes, opts.cuda_device);
+#else
+    throw std::runtime_error(
+        "this binary was built without CUDA support; rerun with --memory host "
+        "or rebuild after CMake can find CUDAToolkit");
+#endif
+}
+
+class StartGate {
+public:
+    explicit StartGate(int expected)
+        : expected_(expected) {}
+
+    void arrive_and_wait() {
+        std::unique_lock<std::mutex> lk(mutex_);
+        ++arrived_;
+        if (arrived_ == expected_) {
+            released_ = true;
+            cv_.notify_all();
+            return;
+        }
+        cv_.wait(lk, [this] { return released_; });
+    }
+
+private:
+    int expected_;
+    int arrived_ = 0;
+    bool released_ = false;
+    std::mutex mutex_;
+    std::condition_variable cv_;
+};
+
+struct WorkerState {
+    std::shared_ptr<RdmaSession> session;
+    std::unique_ptr<LocalBuffer> buffer;
+    std::uint64_t base_offset = 0;
+};
+
+double mean(const std::vector<double>& values) {
+    if (values.empty()) {
+        return 0.0;
+    }
+    return std::accumulate(values.begin(), values.end(), 0.0) /
+           static_cast<double>(values.size());
+}
+
+double percentile(std::vector<double> values, double pct) {
+    if (values.empty()) {
+        return 0.0;
+    }
+    std::sort(values.begin(), values.end());
+    std::size_t idx = static_cast<std::size_t>(
+        std::ceil((pct / 100.0) * static_cast<double>(values.size())));
+    idx = std::min<std::size_t>(std::max<std::size_t>(idx, 1) - 1,
+                                values.size() - 1);
+    return values[idx];
+}
+
+double cv_pct(const std::vector<double>& values) {
+    if (values.size() < 2) {
+        return 0.0;
+    }
+    double avg = mean(values);
+    if (avg <= 0.0) {
+        return 0.0;
+    }
+    double accum = 0.0;
+    for (double value : values) {
+        double diff = value - avg;
+        accum += diff * diff;
+    }
+    double variance = accum / static_cast<double>(values.size() - 1);
+    return std::sqrt(variance) / avg * 100.0;
+}
+
+class PromptReadBench {
+public:
+    PromptReadBench(const Options& opts, int workers)
+        : opts_(opts) {
+        workers_.reserve(static_cast<std::size_t>(workers));
+        if (opts_.endpoint_per_thread) {
+            endpoints_.reserve(static_cast<std::size_t>(workers));
+            for (int worker_id = 0; worker_id < workers; ++worker_id) {
+                endpoints_.push_back(make_endpoint());
+                add_worker(worker_id, *endpoints_.back());
+            }
+        } else {
+            shared_endpoint_ = make_endpoint();
+            for (int worker_id = 0; worker_id < workers; ++worker_id) {
+                add_worker(worker_id, *shared_endpoint_);
+            }
+        }
+
+        for (auto& worker : workers_) {
+            prime_worker(worker);
+        }
+    }
+
+    std::vector<double> measure_threads(int threads) {
+        if (threads < 1 ||
+            threads > static_cast<int>(workers_.size())) {
+            throw std::runtime_error("requested thread count exceeds bench workers");
+        }
+
+        std::vector<std::vector<double>> per_worker(
+            static_cast<std::size_t>(threads));
+        StartGate gate(threads);
+        std::vector<std::thread> thread_pool;
+        std::mutex exception_mutex;
+        std::exception_ptr first_exception;
+        thread_pool.reserve(static_cast<std::size_t>(threads));
+
+        for (int worker_id = 0; worker_id < threads; ++worker_id) {
+            thread_pool.emplace_back([&, worker_id] {
+                try {
+                    gate.arrive_and_wait();
+
+                    auto& worker = workers_[static_cast<std::size_t>(worker_id)];
+                    worker.buffer->activate();
+                    if (opts_.stagger_us > 0) {
+                        std::this_thread::sleep_for(
+                            std::chrono::microseconds(
+                                opts_.stagger_us *
+                                static_cast<std::int64_t>(worker_id)));
+                    }
+
+                    const int total_iters = opts_.warmup + opts_.repeats;
+                    auto next_issue = std::chrono::steady_clock::now();
+                    auto& latencies =
+                        per_worker[static_cast<std::size_t>(worker_id)];
+                    latencies.reserve(static_cast<std::size_t>(opts_.repeats));
+
+                    for (int iteration = 0; iteration < total_iters; ++iteration) {
+                        if (opts_.pace_us > 0 && iteration > 0) {
+                            next_issue += std::chrono::microseconds(opts_.pace_us);
+                            auto now = std::chrono::steady_clock::now();
+                            if (next_issue > now) {
+                                std::this_thread::sleep_until(next_issue);
+                            } else {
+                                next_issue = now;
+                            }
+                        }
+
+                        double latency_us =
+                            worker.session->read_into_transfer_latency_us(
+                                worker.base_offset,
+                                worker.buffer->addr(),
+                                opts_.prompt_bytes,
+                                opts_.prompt_bytes,
+                                nullptr,
+                                worker.buffer->length(),
+                                1,
+                                opts_.debug);
+                        if (iteration >= opts_.warmup) {
+                            latencies.push_back(latency_us);
+                        }
+                    }
+                } catch (...) {
+                    std::lock_guard<std::mutex> lk(exception_mutex);
+                    if (!first_exception) {
+                        first_exception = std::current_exception();
+                    }
+                }
+            });
+        }
+
+        for (auto& thread : thread_pool) {
+            thread.join();
+        }
+        if (first_exception) {
+            std::rethrow_exception(first_exception);
+        }
+
+        std::vector<double> flat;
+        flat.reserve(static_cast<std::size_t>(threads * opts_.repeats));
+        for (auto& worker_latencies : per_worker) {
+            flat.insert(flat.end(), worker_latencies.begin(), worker_latencies.end());
+        }
+        return flat;
+    }
+
+    std::string mr_cache_summary() const {
+        std::uint64_t hits = 0;
+        std::uint64_t misses = 0;
+        std::size_t size = 0;
+        for (const auto& worker : workers_) {
+            hits += worker.session->mr_cache_hits();
+            misses += worker.session->mr_cache_misses();
+            size += worker.session->mr_cache_size();
+        }
+        return "mr_cache_total_size=" + std::to_string(size) +
+               " hits=" + std::to_string(hits) +
+               " misses=" + std::to_string(misses);
+    }
+
+private:
+    std::unique_ptr<RdmaEndpoint> make_endpoint() const {
+        return std::make_unique<RdmaEndpoint>(
+            opts_.ib_port,
+            opts_.ib_device,
+            static_cast<std::uint32_t>(opts_.io_workers),
+            opts_.cq_batch_size);
+    }
+
+    void add_worker(int worker_id, RdmaEndpoint& endpoint) {
+        auto session = endpoint.connect(opts_.host, opts_.port);
+        session->set_mr_cache_limit(opts_.mr_cache_limit);
+        WorkerState worker;
+        worker.session = std::move(session);
+        worker.buffer = make_buffer(opts_);
+        worker.base_offset =
+            opts_.offset +
+            static_cast<std::uint64_t>(worker_id) * opts_.prompt_stride;
+        workers_.push_back(std::move(worker));
+    }
+
+    void prime_worker(WorkerState& worker) const {
+        worker.buffer->activate();
+        worker.session->read_into(
+            worker.base_offset,
+            worker.buffer->addr(),
+            opts_.prompt_bytes,
+            opts_.prompt_bytes,
+            nullptr,
+            worker.buffer->length(),
+            1,
+            opts_.debug);
+    }
+
+    const Options& opts_;
+    std::vector<std::unique_ptr<RdmaEndpoint>> endpoints_;
+    std::unique_ptr<RdmaEndpoint> shared_endpoint_;
+    std::vector<WorkerState> workers_;
+};
+
+void print_header(const Options& opts) {
+    std::cout
+        << "# host=" << opts.host << ":" << opts.port
+        << " memory=" << opts.memory
+        << " cuda_device=" << opts.cuda_device
+        << " prompt_bytes=" << opts.prompt_bytes
+        << " repeats=" << opts.repeats
+        << " warmup=" << opts.warmup
+        << " trials=" << opts.trials
+        << " pace_us=" << opts.pace_us
+        << " stagger_us=" << opts.stagger_us
+        << " max_threads=" << opts.max_threads
+        << " endpoint_mode="
+        << (opts.endpoint_per_thread ? "per_thread" : "shared")
+        << " resource_mode="
+        << (opts.recreate_per_thread_count ? "per_count" : "reuse_max")
+        << " io_workers=" << opts.io_workers
+        << " cq_batch_size=" << opts.cq_batch_size
+        << " rdma_log_level=" << opts.rdma_log_level
+        << " loop=cxx"
+        << " latency_scope=post_send_to_completion"
+        << "\n";
+
+    if (opts.verbose) {
+        std::cout << "threads,avg_us,p50_us,p95_us,p99_us,trial_cv_pct\n";
+    } else {
+        std::cout << "threads,avg_us\n";
+    }
+}
+
+} // namespace
+
+int main(int argc, char* argv[]) {
+    try {
+        Options opts = parse_args(argc, argv);
+        set_spdlog_level_from_name(opts.rdma_log_level);
+
+        std::cout << std::fixed << std::setprecision(4);
+        print_header(opts);
+
+        std::unique_ptr<PromptReadBench> reusable_bench;
+        if (!opts.recreate_per_thread_count) {
+            reusable_bench = std::make_unique<PromptReadBench>(
+                opts,
+                opts.max_threads);
+        }
+
+        for (int threads = opts.min_threads;
+             threads <= opts.max_threads;
+             ++threads) {
+            std::unique_ptr<PromptReadBench> per_count_bench;
+            PromptReadBench* bench = reusable_bench.get();
+            if (opts.recreate_per_thread_count) {
+                per_count_bench = std::make_unique<PromptReadBench>(opts, threads);
+                bench = per_count_bench.get();
+            }
+
+            std::vector<double> latencies;
+            std::vector<double> trial_means;
+            for (int trial = 0; trial < opts.trials; ++trial) {
+                auto trial_latencies = bench->measure_threads(threads);
+                trial_means.push_back(mean(trial_latencies));
+                latencies.insert(
+                    latencies.end(),
+                    trial_latencies.begin(),
+                    trial_latencies.end());
+            }
+
+            if (opts.verbose) {
+                std::cout
+                    << threads << ","
+                    << mean(latencies) << ","
+                    << percentile(latencies, 50.0) << ","
+                    << percentile(latencies, 95.0) << ","
+                    << percentile(latencies, 99.0) << ","
+                    << cv_pct(trial_means)
+                    << "\n";
+            } else {
+                std::cout << threads << "," << mean(latencies) << "\n";
+            }
+            std::cout.flush();
+        }
+
+        if (reusable_bench) {
+            std::cout << "# " << reusable_bench->mr_cache_summary() << "\n";
+        }
+        return 0;
+    } catch (const std::exception& e) {
+        std::cerr << "rdma_prompt_read_latency failed: " << e.what() << "\n";
+        return 1;
+    }
+}
