@@ -234,16 +234,20 @@ CUDA Toolkit 可被 CMake 找到时，测试程序支持 `--memory cuda`，直�
   --prompt-bytes 128 \
   --min-threads 1 \
   --max-threads 16 \
-  --repeats 100 \
-  --warmup 10 \
-  --verbose
+  --repeats 5000 \
+  --warmup 500 \
+  --trials 5
 ```
 
-输出 CSV 字段和 `Sequoia/tests/rdma_prompt_read_latency.py` 基本对齐：
-`threads,avg_us`，加 `--verbose` 后输出
-`threads,avg_us,p50_us,p95_us,p99_us,trial_cv_pct`。计时范围是 C++ 侧
-`post_send` 到 completion callback 唤醒后的耗时，避免 Python 循环、
-GIL、PyTorch tensor 调用等 per-request 开销。
+注意：bash 续行符 `\` 必须是这一行最后一个字符，后面不能有空格。
+如果写成 `\ `，shell 会把后面的空格当作普通参数，并把下一行的
+`--port` 当成新命令执行。
+
+输出固定为 `threads,avg_us`。每个 `threads=N` 的每个 trial 都会重新
+创建 N 个 endpoint/CQ/QP，然后执行 `warmup + repeats` 次 READ，最终把
+所有 trial 的 READ 延迟取平均。计时范围是 C++ 侧 `post_send` 到
+completion callback 唤醒后的耗时，避免 Python 循环、GIL、PyTorch
+tensor 调用等 per-request 开销。
 
 更详细的 GDR 说明见 [`GDR_USAGE.md`](GDR_USAGE.md)。
 

@@ -53,16 +53,15 @@ struct Options {
     std::uint64_t prompt_bytes = 0;
     int min_threads = 1;
     int max_threads = 16;
-    int repeats = 100;
-    int warmup = 10;
-    int trials = 1;
+    int repeats = 5000;
+    int warmup = 500;
+    int trials = 5;
     std::int64_t pace_us = 0;
     std::int64_t stagger_us = 0;
     int io_workers = 1;
     std::size_t cq_batch_size = 16;
     std::size_t mr_cache_limit = 16;
     bool endpoint_per_thread = true;
-    bool recreate_per_thread_count = true;
     bool verbose = false;
     bool debug = false;
     std::string rdma_log_level = "warn";
@@ -81,6 +80,16 @@ std::string lower_copy(std::string value) {
             return static_cast<char>(std::tolower(ch));
         });
     return value;
+}
+
+bool is_blank_arg(const std::string& value) {
+    return !value.empty() &&
+           std::all_of(
+               value.begin(),
+               value.end(),
+               [](unsigned char ch) {
+                   return std::isspace(ch) != 0;
+               });
 }
 
 std::uint64_t parse_size(const std::string& text) {
@@ -176,19 +185,16 @@ void print_usage(const char* prog) {
         << "Benchmark options:\n"
         << "  --min-threads N             default: 1\n"
         << "  --max-threads N             default: 16\n"
-        << "  --repeats N                 default: 100\n"
-        << "  --warmup N                  default: 10\n"
-        << "  --trials N                  default: 1\n"
+        << "  --repeats N                 default: 5000\n"
+        << "  --warmup N                  default: 500\n"
+        << "  --trials N                  default: 5; each trial recreates QP/CQ\n"
         << "  --pace-us N                 default: 0\n"
         << "  --stagger-us N              default: 0\n"
         << "  --io-workers N              default: 1\n"
         << "  --cq-batch-size N           default: 16\n"
         << "  --mr-cache-limit N          default: 16, 0 disables cache\n"
-        << "  --endpoint-per-thread       default\n"
-        << "  --shared-endpoint\n"
-        << "  --recreate-per-thread-count default\n"
-        << "  --reuse-max-threads\n"
-        << "  --verbose\n"
+        << "  --endpoint-per-thread       default; one endpoint/CQ/QP per worker\n"
+        << "  --verbose                   accepted for compatibility; output remains avg only\n"
         << "  --debug\n"
         << "  --rdma-log-level LEVEL      trace/debug/info/warn/error/critical/off\n";
 }
@@ -197,6 +203,12 @@ Options parse_args(int argc, char* argv[]) {
     Options opts;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
+        if (is_blank_arg(arg)) {
+            usage_error(
+                "blank argument detected. In shell commands, a line-continuation "
+                "backslash must be the final character on the line; remove any "
+                "spaces after '\\'.");
+        }
         if (arg == "-h" || arg == "--help") {
             print_usage(argv[0]);
             std::exit(0);
@@ -275,11 +287,14 @@ Options parse_args(int argc, char* argv[]) {
         } else if (arg == "--endpoint-per-thread") {
             opts.endpoint_per_thread = true;
         } else if (arg == "--shared-endpoint") {
-            opts.endpoint_per_thread = false;
-        } else if (arg == "--recreate-per-thread-count") {
-            opts.recreate_per_thread_count = true;
-        } else if (arg == "--reuse-max-threads") {
-            opts.recreate_per_thread_count = false;
+            usage_error(
+                "--shared-endpoint is no longer supported; this benchmark "
+                "requires one endpoint/CQ/QP per worker");
+        } else if (arg == "--recreate-per-thread-count" ||
+                   arg == "--reuse-max-threads") {
+            usage_error(
+                arg + " is no longer supported; this benchmark now recreates "
+                "QP/CQ for every thread-count trial");
         } else if (arg == "--verbose") {
             opts.verbose = true;
         } else if (arg == "--debug") {
@@ -656,33 +671,8 @@ private:
 };
 
 void print_header(const Options& opts) {
-    std::cout
-        << "# host=" << opts.host << ":" << opts.port
-        << " memory=" << opts.memory
-        << " cuda_device=" << opts.cuda_device
-        << " prompt_bytes=" << opts.prompt_bytes
-        << " repeats=" << opts.repeats
-        << " warmup=" << opts.warmup
-        << " trials=" << opts.trials
-        << " pace_us=" << opts.pace_us
-        << " stagger_us=" << opts.stagger_us
-        << " max_threads=" << opts.max_threads
-        << " endpoint_mode="
-        << (opts.endpoint_per_thread ? "per_thread" : "shared")
-        << " resource_mode="
-        << (opts.recreate_per_thread_count ? "per_count" : "reuse_max")
-        << " io_workers=" << opts.io_workers
-        << " cq_batch_size=" << opts.cq_batch_size
-        << " rdma_log_level=" << opts.rdma_log_level
-        << " loop=cxx"
-        << " latency_scope=post_send_to_completion"
-        << "\n";
-
-    if (opts.verbose) {
-        std::cout << "threads,avg_us,p50_us,p95_us,p99_us,trial_cv_pct\n";
-    } else {
-        std::cout << "threads,avg_us\n";
-    }
+    (void)opts;
+    std::cout << "threads,avg_us\n";
 }
 
 } // namespace
@@ -695,51 +685,21 @@ int main(int argc, char* argv[]) {
         std::cout << std::fixed << std::setprecision(4);
         print_header(opts);
 
-        std::unique_ptr<PromptReadBench> reusable_bench;
-        if (!opts.recreate_per_thread_count) {
-            reusable_bench = std::make_unique<PromptReadBench>(
-                opts,
-                opts.max_threads);
-        }
-
         for (int threads = opts.min_threads;
              threads <= opts.max_threads;
              ++threads) {
-            std::unique_ptr<PromptReadBench> per_count_bench;
-            PromptReadBench* bench = reusable_bench.get();
-            if (opts.recreate_per_thread_count) {
-                per_count_bench = std::make_unique<PromptReadBench>(opts, threads);
-                bench = per_count_bench.get();
-            }
-
             std::vector<double> latencies;
-            std::vector<double> trial_means;
             for (int trial = 0; trial < opts.trials; ++trial) {
-                auto trial_latencies = bench->measure_threads(threads);
-                trial_means.push_back(mean(trial_latencies));
+                PromptReadBench bench(opts, threads);
+                auto trial_latencies = bench.measure_threads(threads);
                 latencies.insert(
                     latencies.end(),
                     trial_latencies.begin(),
                     trial_latencies.end());
             }
 
-            if (opts.verbose) {
-                std::cout
-                    << threads << ","
-                    << mean(latencies) << ","
-                    << percentile(latencies, 50.0) << ","
-                    << percentile(latencies, 95.0) << ","
-                    << percentile(latencies, 99.0) << ","
-                    << cv_pct(trial_means)
-                    << "\n";
-            } else {
-                std::cout << threads << "," << mean(latencies) << "\n";
-            }
+            std::cout << threads << "," << mean(latencies) << "\n";
             std::cout.flush();
-        }
-
-        if (reusable_bench) {
-            std::cout << "# " << reusable_bench->mr_cache_summary() << "\n";
         }
         return 0;
     } catch (const std::exception& e) {
