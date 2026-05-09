@@ -245,7 +245,8 @@ CUDA Toolkit 可被 CMake 找到时，测试程序支持 `--memory cuda`，直�
 `--port` 当成新命令执行。
 
 输出固定为 `threads,avg_us`。每个 `threads=N` 的每个 trial 都会重新
-创建 N 个 endpoint/CQ/QP，然后执行 `warmup + repeats` 次 READ，最终把
+创建 N 个 endpoint/CQ/QP，然后执行 `warmup + repeats` 轮 READ，默认
+每轮用 `--round-sync` 让 N 个 worker 同时各发起一次 READ，最终把
 所有 trial 的 READ 延迟取平均。默认 `--completion-mode raw-poll`，连接
 和预热后会关闭后台 CQ poller，正式计时阶段由发起 READ 的 worker 线程
 直接 `post_send` 并 busy-poll 自己的 CQ；计时范围是 `post_send` 到
@@ -255,6 +256,8 @@ callback/executor/condition_variable 路径开销。
 raw-poll 对 CPU 调度非常敏感。`--cpu-list` 会把第 N 个 worker 固定到列表
 中的第 N 个 CPU，例如 `--cpu-list 0-7,16-23`。实际测试时应优先选择和
 RDMA 网卡、GPU 在同一个 NUMA node 上的物理核，避免使用 SMT sibling。
+也可以用 `--auto-cpu-list --cpu-candidates ...` 先在候选 CPU 上逐个测
+单线程延迟，再自动选出最快的 `--max-threads` 个 CPU 做正式测试。
 
 更详细的 GDR 说明见 [`GDR_USAGE.md`](GDR_USAGE.md)。
 

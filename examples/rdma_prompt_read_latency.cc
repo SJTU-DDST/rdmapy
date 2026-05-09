@@ -1,6 +1,7 @@
 #include "rdma_session.hpp"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -62,12 +63,17 @@ struct Options {
     int repeats = 5000;
     int warmup = 500;
     int trials = 5;
+    int cpu_scan_repeats = 2000;
+    int cpu_scan_warmup = 200;
     std::int64_t pace_us = 0;
     std::int64_t stagger_us = 0;
     int io_workers = 1;
     std::size_t cq_batch_size = 16;
     std::size_t mr_cache_limit = 16;
     std::vector<int> cpu_list;
+    std::vector<int> cpu_candidates;
+    bool auto_cpu_list = false;
+    bool round_sync = true;
     bool endpoint_per_thread = true;
     bool verbose = false;
     bool debug = false;
@@ -221,6 +227,11 @@ std::vector<int> parse_cpu_list(const std::string& text) {
     return cpus;
 }
 
+bool has_duplicates(std::vector<int> values) {
+    std::sort(values.begin(), values.end());
+    return std::adjacent_find(values.begin(), values.end()) != values.end();
+}
+
 void print_usage(const char* prog) {
     std::cout
         << "Usage:\n"
@@ -249,6 +260,12 @@ void print_usage(const char* prog) {
         << "  --cq-batch-size N           default: 16\n"
         << "  --mr-cache-limit N          default: 16, 0 disables cache\n"
         << "  --cpu-list LIST             pin workers, e.g. 0-7,16-23\n"
+        << "  --auto-cpu-list             benchmark candidate CPUs and use the fastest\n"
+        << "  --cpu-candidates LIST       candidates for --auto-cpu-list\n"
+        << "  --cpu-scan-repeats N        default: 2000\n"
+        << "  --cpu-scan-warmup N         default: 200\n"
+        << "  --round-sync                default; sync workers before every READ\n"
+        << "  --no-round-sync             let each worker loop independently\n"
         << "  --endpoint-per-thread       default; one endpoint/CQ/QP per worker\n"
         << "  --verbose                   accepted for compatibility; output remains avg only\n"
         << "  --debug\n"
@@ -323,6 +340,14 @@ Options parse_args(int argc, char* argv[]) {
             opts.trials = static_cast<int>(
                 parse_ll(arg, take_value(i, argc, argv, arg), 1,
                          std::numeric_limits<int>::max()));
+        } else if (arg == "--cpu-scan-repeats") {
+            opts.cpu_scan_repeats = static_cast<int>(
+                parse_ll(arg, take_value(i, argc, argv, arg), 1,
+                         std::numeric_limits<int>::max()));
+        } else if (arg == "--cpu-scan-warmup") {
+            opts.cpu_scan_warmup = static_cast<int>(
+                parse_ll(arg, take_value(i, argc, argv, arg), 0,
+                         std::numeric_limits<int>::max()));
         } else if (arg == "--pace-us") {
             opts.pace_us = parse_ll(arg, take_value(i, argc, argv, arg), 0,
                                     std::numeric_limits<std::int64_t>::max());
@@ -343,6 +368,14 @@ Options parse_args(int argc, char* argv[]) {
                          std::numeric_limits<int>::max()));
         } else if (arg == "--cpu-list") {
             opts.cpu_list = parse_cpu_list(take_value(i, argc, argv, arg));
+        } else if (arg == "--auto-cpu-list") {
+            opts.auto_cpu_list = true;
+        } else if (arg == "--cpu-candidates") {
+            opts.cpu_candidates = parse_cpu_list(take_value(i, argc, argv, arg));
+        } else if (arg == "--round-sync") {
+            opts.round_sync = true;
+        } else if (arg == "--no-round-sync") {
+            opts.round_sync = false;
         } else if (arg == "--endpoint-per-thread") {
             opts.endpoint_per_thread = true;
         } else if (arg == "--shared-endpoint") {
@@ -397,6 +430,15 @@ Options parse_args(int argc, char* argv[]) {
     if (opts.completion_mode != "raw-poll" &&
         opts.completion_mode != "callback") {
         usage_error("--completion-mode must be raw-poll or callback");
+    }
+    if (opts.auto_cpu_list && !opts.cpu_list.empty()) {
+        usage_error("--auto-cpu-list cannot be used with --cpu-list");
+    }
+    if (has_duplicates(opts.cpu_list)) {
+        usage_error("--cpu-list contains duplicate CPUs");
+    }
+    if (has_duplicates(opts.cpu_candidates)) {
+        usage_error("--cpu-candidates contains duplicate CPUs");
     }
     if (!opts.cpu_list.empty() &&
         static_cast<int>(opts.cpu_list.size()) < opts.max_threads) {
@@ -553,6 +595,32 @@ private:
     std::condition_variable cv_;
 };
 
+class ReusableGate {
+public:
+    explicit ReusableGate(int expected)
+        : expected_(expected) {}
+
+    void arrive_and_wait() {
+        std::unique_lock<std::mutex> lk(mutex_);
+        const int generation = generation_;
+        ++arrived_;
+        if (arrived_ == expected_) {
+            arrived_ = 0;
+            ++generation_;
+            cv_.notify_all();
+            return;
+        }
+        cv_.wait(lk, [&] { return generation_ != generation; });
+    }
+
+private:
+    int expected_;
+    int arrived_ = 0;
+    int generation_ = 0;
+    std::mutex mutex_;
+    std::condition_variable cv_;
+};
+
 struct WorkerState {
     std::shared_ptr<RdmaSession> session;
     std::unique_ptr<LocalBuffer> buffer;
@@ -600,6 +668,9 @@ class PromptReadBench {
 public:
     PromptReadBench(const Options& opts, int workers)
         : opts_(opts) {
+        if (!opts_.cpu_list.empty()) {
+            pin_current_thread_to_cpu(opts_.cpu_list.front());
+        }
         workers_.reserve(static_cast<std::size_t>(workers));
         if (opts_.endpoint_per_thread) {
             endpoints_.reserve(static_cast<std::size_t>(workers));
@@ -631,6 +702,7 @@ public:
         std::vector<std::vector<double>> per_worker(
             static_cast<std::size_t>(threads));
         StartGate gate(threads);
+        ReusableGate round_gate(threads);
         std::vector<std::thread> thread_pool;
         std::mutex exception_mutex;
         std::exception_ptr first_exception;
@@ -661,6 +733,9 @@ public:
                     latencies.reserve(static_cast<std::size_t>(opts_.repeats));
 
                     for (int iteration = 0; iteration < total_iters; ++iteration) {
+                        if (opts_.round_sync) {
+                            round_gate.arrive_and_wait();
+                        }
                         if (opts_.pace_us > 0 && iteration > 0) {
                             next_issue += std::chrono::microseconds(opts_.pace_us);
                             auto now = std::chrono::steady_clock::now();
@@ -786,6 +861,70 @@ private:
     std::vector<WorkerState> workers_;
 };
 
+std::vector<int> allowed_cpus() {
+#ifdef __linux__
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    int rc = sched_getaffinity(0, sizeof(set), &set);
+    if (rc != 0) {
+        throw std::runtime_error(
+            std::string("sched_getaffinity failed: ") + std::strerror(errno));
+    }
+
+    std::vector<int> cpus;
+    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+        if (CPU_ISSET(cpu, &set)) {
+            cpus.push_back(cpu);
+        }
+    }
+    if (cpus.empty()) {
+        throw std::runtime_error("sched_getaffinity returned no allowed CPUs");
+    }
+    return cpus;
+#else
+    throw std::runtime_error("--auto-cpu-list is only supported on Linux");
+#endif
+}
+
+std::vector<int> select_fastest_cpus(const Options& opts) {
+    std::vector<int> candidates =
+        opts.cpu_candidates.empty() ? allowed_cpus() : opts.cpu_candidates;
+    if (static_cast<int>(candidates.size()) < opts.max_threads) {
+        usage_error("--cpu-candidates must contain at least --max-threads CPUs");
+    }
+
+    std::vector<std::pair<double, int>> scores;
+    scores.reserve(candidates.size());
+    for (int cpu : candidates) {
+        Options scan_opts = opts;
+        scan_opts.cpu_list = {cpu};
+        scan_opts.cpu_candidates.clear();
+        scan_opts.auto_cpu_list = false;
+        scan_opts.repeats = opts.cpu_scan_repeats;
+        scan_opts.warmup = opts.cpu_scan_warmup;
+        scan_opts.trials = 1;
+
+        PromptReadBench bench(scan_opts, 1);
+        std::vector<double> latencies = bench.measure_threads(1);
+        scores.emplace_back(mean(latencies), cpu);
+    }
+
+    std::sort(scores.begin(), scores.end(),
+              [](const auto& lhs, const auto& rhs) {
+                  if (lhs.first == rhs.first) {
+                      return lhs.second < rhs.second;
+                  }
+                  return lhs.first < rhs.first;
+              });
+
+    std::vector<int> selected;
+    selected.reserve(static_cast<std::size_t>(opts.max_threads));
+    for (int i = 0; i < opts.max_threads; ++i) {
+        selected.push_back(scores[static_cast<std::size_t>(i)].second);
+    }
+    return selected;
+}
+
 void print_header(const Options& opts) {
     (void)opts;
     std::cout << "threads,avg_us\n";
@@ -797,6 +936,9 @@ int main(int argc, char* argv[]) {
     try {
         Options opts = parse_args(argc, argv);
         set_spdlog_level_from_name(opts.rdma_log_level);
+        if (opts.auto_cpu_list) {
+            opts.cpu_list = select_fastest_cpus(opts);
+        }
 
         std::cout << std::fixed << std::setprecision(4);
         print_header(opts);
