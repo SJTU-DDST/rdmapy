@@ -44,8 +44,8 @@ struct ServerOptions {
     std::uint16_t port = 2333;
     int ib_device = 0;
     int ib_port = 1;
-    int io_threads = 1;
-    std::size_t cq_batch_size = 16;
+    int io_threads = 4;
+    std::size_t cq_batch_size = 32;
     int max_connections = 64;
     int prompts = 4096;
     int token_len = 32;
@@ -102,8 +102,8 @@ void print_usage(const char* prog) {
         << "  --port PORT                 default: 2333\n"
         << "  --ib-device DEV             default: 0\n"
         << "  --ib-port PORT              default: 1\n"
-        << "  --io-threads N              default: 1\n"
-        << "  --cq-batch-size N           default: 16\n"
+        << "  --io-threads N              default: 4\n"
+        << "  --cq-batch-size N           default: 32\n"
         << "  --max-connections N         default: 64\n"
         << "  --rdma-log-level LEVEL      trace/debug/info/warn/error/critical/off\n\n"
         << "Prompt DB options:\n"
@@ -324,6 +324,25 @@ void fill_result_buffer(std::vector<std::uint8_t>& result_buffer,
     }
 }
 
+void post_ack_without_wait(std::shared_ptr<rdmapp::qp> qp,
+                           const rdmapp::local_mr& ack_mr) {
+    struct ibv_sge sge = {};
+    sge.addr = reinterpret_cast<std::uint64_t>(ack_mr.addr());
+    sge.length = static_cast<std::uint32_t>(ack_mr.length());
+    sge.lkey = ack_mr.lkey();
+
+    struct ibv_send_wr send_wr = {};
+    struct ibv_send_wr* bad_send_wr = nullptr;
+    send_wr.opcode = IBV_WR_SEND;
+    send_wr.next = nullptr;
+    send_wr.num_sge = 1;
+    send_wr.sg_list = &sge;
+    send_wr.wr_id = 0;
+    send_wr.send_flags = IBV_SEND_SIGNALED;
+
+    qp->post_send(send_wr, bad_send_wr);
+}
+
 asio::awaitable<void> handle_client(std::shared_ptr<rdmapp::qp> qp,
                                     std::shared_ptr<const PromptDbState> db,
                                     std::shared_ptr<const ServerOptions> opts) {
@@ -354,6 +373,15 @@ asio::awaitable<void> handle_client(std::shared_ptr<rdmapp::qp> qp,
             prompt_buffer.size() * sizeof(std::uint32_t)));
     auto result_mr = std::make_shared<rdmapp::local_mr>(
         qp->pd_ptr()->reg_mr(result_buffer.data(), result_buffer.size()));
+    constexpr std::size_t kAckRingSize = 128;
+    std::vector<AckWire> ack_ring(kAckRingSize);
+    std::vector<std::shared_ptr<rdmapp::local_mr>> ack_mrs;
+    ack_mrs.reserve(kAckRingSize);
+    for (auto& ack_slot : ack_ring) {
+        ack_mrs.push_back(std::make_shared<rdmapp::local_mr>(
+            qp->pd_ptr()->reg_mr(&ack_slot, sizeof(AckWire))));
+    }
+    std::size_t ack_slot_id = 0;
 
     while (true) {
         RequestWire req = co_await recv_pod<RequestWire>(qp, "request");
@@ -365,14 +393,18 @@ asio::awaitable<void> handle_client(std::shared_ptr<rdmapp::qp> qp,
             co_return;
         }
         if (req.op != static_cast<std::uint16_t>(RequestOp::query)) {
-            AckWire ack;
+            const std::size_t slot = ack_slot_id++ % kAckRingSize;
+            AckWire& ack = ack_ring[slot];
+            ack = AckWire{};
             ack.status = static_cast<std::uint16_t>(Status::bad_request);
             ack.request_id = req.request_id;
-            co_await send_pod(qp, ack);
+            post_ack_without_wait(qp, *ack_mrs[slot]);
             continue;
         }
 
-        AckWire ack;
+        const std::size_t slot = ack_slot_id++ % kAckRingSize;
+        AckWire& ack = ack_ring[slot];
+        ack = AckWire{};
         ack.request_id = req.request_id;
         try {
             if (req.token_count == 0 || req.token_count > hello.max_tokens) {
@@ -418,7 +450,7 @@ asio::awaitable<void> handle_client(std::shared_ptr<rdmapp::qp> qp,
             ack.best_idx = -1;
         }
 
-        co_await send_pod(qp, ack);
+        post_ack_without_wait(qp, *ack_mrs[slot]);
     }
 }
 
