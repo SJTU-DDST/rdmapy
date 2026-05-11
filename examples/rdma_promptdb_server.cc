@@ -334,14 +334,17 @@ asio::awaitable<void> handle_client(std::shared_ptr<rdmapp::qp> qp,
     ServerHelloWire server_hello;
     server_hello.max_tokens = static_cast<std::uint32_t>(opts->max_tokens);
     server_hello.result_header_bytes = sizeof(ResultHeaderWire);
+    std::exception_ptr hello_error;
     try {
         validate_client_hello(hello, *opts);
-    } catch (const std::exception& e) {
+    } catch (...) {
         server_hello.status = static_cast<std::uint16_t>(Status::bad_request);
-        co_await send_pod(qp, server_hello);
-        throw;
+        hello_error = std::current_exception();
     }
     co_await send_pod(qp, server_hello);
+    if (hello_error) {
+        std::rethrow_exception(hello_error);
+    }
 
     std::vector<std::uint32_t> prompt_buffer(hello.max_tokens);
     std::vector<std::uint8_t> result_buffer(hello.result_bytes);
