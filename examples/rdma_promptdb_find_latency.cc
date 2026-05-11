@@ -5,6 +5,7 @@
 #include <asio/use_future.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -372,10 +373,31 @@ void raw_send_mr_wait(std::shared_ptr<rdmapp::qp> qp,
     }
 }
 
+void raw_send_mr_nowait(std::shared_ptr<rdmapp::qp> qp,
+                        const rdmapp::local_mr& local_mr) {
+    struct ibv_sge sge = {};
+    sge.addr = reinterpret_cast<std::uint64_t>(local_mr.addr());
+    sge.length = static_cast<std::uint32_t>(local_mr.length());
+    sge.lkey = local_mr.lkey();
+
+    struct ibv_send_wr send_wr = {};
+    struct ibv_send_wr* bad_send_wr = nullptr;
+    send_wr.opcode = IBV_WR_SEND;
+    send_wr.next = nullptr;
+    send_wr.num_sge = 1;
+    send_wr.sg_list = &sge;
+    send_wr.wr_id = 1;
+    send_wr.send_flags = 0;
+
+    qp->post_send(send_wr, bad_send_wr);
+}
+
 struct RawRecvState {
     std::shared_ptr<rdmapp::qp> qp;
     std::uint32_t expected_bytes = 0;
     const char* what = "recv";
+    bool check_bytes = true;
+    bool expect_imm = false;
 };
 
 RawRecvState raw_post_recv_mr(std::shared_ptr<rdmapp::qp> qp,
@@ -395,7 +417,21 @@ RawRecvState raw_post_recv_mr(std::shared_ptr<rdmapp::qp> qp,
     recv_wr.sg_list = &sge;
 
     qp->post_recv(recv_wr, bad_recv_wr);
-    return RawRecvState{std::move(qp), expected_bytes, what};
+    return RawRecvState{
+        std::move(qp), expected_bytes, what, true, false};
+}
+
+RawRecvState raw_post_recv_imm(std::shared_ptr<rdmapp::qp> qp,
+                               const char* what) {
+    struct ibv_recv_wr recv_wr = {};
+    struct ibv_recv_wr* bad_recv_wr = nullptr;
+    recv_wr.next = nullptr;
+    recv_wr.wr_id = 2;
+    recv_wr.num_sge = 0;
+    recv_wr.sg_list = nullptr;
+
+    qp->post_recv(recv_wr, bad_recv_wr);
+    return RawRecvState{std::move(qp), 0, what, false, true};
 }
 
 void raw_wait_recv(const RawRecvState& state) {
@@ -408,7 +444,14 @@ void raw_wait_recv(const RawRecvState& state) {
             ibv_wc_status_str(wc.status) +
             " (status=" + std::to_string(static_cast<int>(wc.status)) + ")");
     }
-    if (wc.byte_len != state.expected_bytes) {
+    if (state.expect_imm &&
+        (wc.opcode != IBV_WC_RECV_RDMA_WITH_IMM ||
+         !(wc.wc_flags & IBV_WC_WITH_IMM))) {
+        throw std::runtime_error(
+            std::string("expected RDMA write-with-imm completion for ") +
+            state.what);
+    }
+    if (state.check_bytes && wc.byte_len != state.expected_bytes) {
         throw std::runtime_error(
             std::string("short raw recv for ") + state.what + ": got " +
             std::to_string(wc.byte_len) + " expected " +
@@ -602,6 +645,8 @@ public:
             pd_->reg_mr(result_buffer_.data(), result_buffer_.size()));
         ack_mr_ = std::make_shared<rdmapp::local_mr>(
             pd_->reg_mr(&ack_buffer_, sizeof(ack_buffer_)));
+        request_mr_ = std::make_shared<rdmapp::local_mr>(
+            pd_->reg_mr(&request_buffer_, sizeof(request_buffer_)));
 
         auto connector = std::make_shared<rdmapp::qp_connector>(
             opts.host, opts.port, pd_, recv_cq_, send_cq_);
@@ -637,19 +682,21 @@ public:
         }
         std::copy(tokens.begin(), tokens.end(), prompt_buffer_.begin());
 
-        RequestWire req;
-        req.request_id = request_id;
-        req.token_count = static_cast<std::uint32_t>(tokens.size());
+        request_buffer_ = RequestWire{};
+        request_buffer_.request_id = request_id;
+        request_buffer_.token_count =
+            static_cast<std::uint32_t>(tokens.size());
 
-        auto ack_state = raw_post_recv_mr(
-            qp_, *ack_mr_, sizeof(ack_buffer_), "ack");
+        auto ack_state = raw_post_recv_imm(qp_, "ack write-with-imm");
         auto t0 = std::chrono::steady_clock::now();
-        raw_send_pod_wait(qp_, req);
+        std::atomic_thread_fence(std::memory_order_release);
+        raw_send_mr_nowait(qp_, *request_mr_);
         raw_wait_recv(ack_state);
+        std::atomic_thread_fence(std::memory_order_acquire);
         AckWire ack = ack_buffer_;
         auto t1 = std::chrono::steady_clock::now();
 
-        validate_ack_and_result(ack, req.request_id);
+        validate_ack_and_result(ack, request_buffer_.request_id);
         QuerySample sample;
         sample.total_us =
             std::chrono::duration<double, std::micro>(t1 - t0).count();
@@ -676,6 +723,8 @@ private:
         raw_send_bytes_wait(qp_, prompt_serialized);
         auto result_serialized = result_mr_->serialize();
         raw_send_bytes_wait(qp_, result_serialized);
+        auto ack_serialized = ack_mr_->serialize();
+        raw_send_bytes_wait(qp_, ack_serialized);
         raw_wait_recv(resp_state);
 
         if (resp.magic != promptdb_rdma::kServerHelloMagic ||
@@ -691,10 +740,12 @@ private:
         }
         closed_ = true;
         try {
-            RequestWire req;
-            req.op = static_cast<std::uint16_t>(RequestOp::shutdown);
-            req.request_id = std::numeric_limits<std::uint64_t>::max();
-            raw_send_pod_wait(qp_, req);
+            request_buffer_ = RequestWire{};
+            request_buffer_.op =
+                static_cast<std::uint16_t>(RequestOp::shutdown);
+            request_buffer_.request_id =
+                std::numeric_limits<std::uint64_t>::max();
+            raw_send_mr_wait(qp_, *request_mr_);
         } catch (...) {
         }
     }
@@ -742,6 +793,8 @@ private:
     std::shared_ptr<rdmapp::local_mr> result_mr_;
     AckWire ack_buffer_{};
     std::shared_ptr<rdmapp::local_mr> ack_mr_;
+    RequestWire request_buffer_{};
+    std::shared_ptr<rdmapp::local_mr> request_mr_;
     std::vector<std::jthread> io_threads_;
     std::optional<asio::executor_work_guard<asio::io_context::executor_type>>
         work_guard_;
@@ -864,7 +917,7 @@ int main(int argc, char* argv[]) {
             << " trials=" << opts.trials
             << " thread_gap_ms=" << opts.thread_gap_ms
             << " sync_each_repeat=" << (opts.sync_each_repeat ? "true" : "false")
-            << " data_path=server_rdma_read_prompt_then_rdma_write_result\n";
+            << " data_path=send_request_rdma_read_prompt_rdma_write_result_ack_write_imm\n";
         if (opts.verbose) {
             std::cout
                 << "threads,total_avg_us,total_p50_us,total_p95_us,total_p99_us,"

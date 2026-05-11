@@ -430,6 +430,45 @@ double raw_rdma_wait(std::shared_ptr<rdmapp::qp> qp,
     return elapsed_us(t0, t1);
 }
 
+double raw_write_with_imm_wait(std::shared_ptr<rdmapp::qp> qp,
+                               rdmapp::remote_mr remote_mr,
+                               const rdmapp::local_mr& local_mr,
+                               void* local_addr,
+                               std::uint32_t length,
+                               std::uint32_t imm) {
+    struct ibv_sge sge = {};
+    sge.addr = reinterpret_cast<std::uint64_t>(local_addr);
+    sge.length = length;
+    sge.lkey = local_mr.lkey();
+
+    struct ibv_send_wr send_wr = {};
+    struct ibv_send_wr* bad_send_wr = nullptr;
+    send_wr.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
+    send_wr.next = nullptr;
+    send_wr.num_sge = 1;
+    send_wr.sg_list = &sge;
+    send_wr.wr_id = 2;
+    send_wr.send_flags = IBV_SEND_SIGNALED;
+    send_wr.imm_data = imm;
+    send_wr.wr.rdma.remote_addr =
+        reinterpret_cast<std::uint64_t>(remote_mr.addr());
+    send_wr.wr.rdma.rkey = remote_mr.rkey();
+
+    struct ibv_wc wc = {};
+    const auto t0 = std::chrono::steady_clock::now();
+    qp->post_send(send_wr, bad_send_wr);
+    while (!qp->poll_send_cq(wc)) {
+    }
+    const auto t1 = std::chrono::steady_clock::now();
+    if (wc.status != IBV_WC_SUCCESS) {
+        throw std::runtime_error(
+            std::string("raw RDMA write-with-imm failed: ") +
+            ibv_wc_status_str(wc.status) +
+            " (status=" + std::to_string(static_cast<int>(wc.status)) + ")");
+    }
+    return elapsed_us(t0, t1);
+}
+
 asio::awaitable<rdmapp::remote_mr>
 recv_remote_mr(std::shared_ptr<rdmapp::qp> qp, const char* what) {
     char serialized[rdmapp::remote_mr::kSerializedSize];
@@ -513,23 +552,23 @@ void fill_result_buffer(std::vector<std::uint8_t>& result_buffer,
     }
 }
 
-void post_ack_without_wait(std::shared_ptr<rdmapp::qp> qp,
-                           const rdmapp::local_mr& ack_mr) {
-    struct ibv_sge sge = {};
-    sge.addr = reinterpret_cast<std::uint64_t>(ack_mr.addr());
-    sge.length = static_cast<std::uint32_t>(ack_mr.length());
-    sge.lkey = ack_mr.lkey();
-
-    struct ibv_send_wr send_wr = {};
-    struct ibv_send_wr* bad_send_wr = nullptr;
-    send_wr.opcode = IBV_WR_SEND;
-    send_wr.next = nullptr;
-    send_wr.num_sge = 1;
-    send_wr.sg_list = &sge;
-    send_wr.wr_id = 0;
-    send_wr.send_flags = 0;
-
-    qp->post_send(send_wr, bad_send_wr);
+void write_ack_with_imm_wait(std::shared_ptr<rdmapp::qp> qp,
+                             rdmapp::remote_mr ack_remote,
+                             const rdmapp::local_mr& ack_mr,
+                             AckWire& ack) {
+    auto ack_sub = sub_remote_mr(
+        ack_remote,
+        0,
+        static_cast<std::uint32_t>(sizeof(AckWire)),
+        "ack");
+    std::atomic_thread_fence(std::memory_order_release);
+    (void)raw_write_with_imm_wait(
+        qp,
+        ack_sub,
+        ack_mr,
+        &ack,
+        static_cast<std::uint32_t>(sizeof(AckWire)),
+        static_cast<std::uint32_t>(ack.request_id));
 }
 
 asio::awaitable<void> handle_client(std::shared_ptr<AcceptedClient> client,
@@ -542,6 +581,8 @@ asio::awaitable<void> handle_client(std::shared_ptr<AcceptedClient> client,
         raw_recv_remote_mr_wait(qp, "prompt");
     rdmapp::remote_mr result_remote =
         raw_recv_remote_mr_wait(qp, "result");
+    rdmapp::remote_mr ack_remote =
+        raw_recv_remote_mr_wait(qp, "ack");
 
     ServerHelloWire server_hello;
     server_hello.max_tokens = static_cast<std::uint32_t>(opts->max_tokens);
@@ -566,6 +607,9 @@ asio::awaitable<void> handle_client(std::shared_ptr<AcceptedClient> client,
             prompt_buffer.size() * sizeof(std::uint32_t)));
     auto result_mr = std::make_shared<rdmapp::local_mr>(
         qp->pd_ptr()->reg_mr(result_buffer.data(), result_buffer.size()));
+    RequestWire request_buffer{};
+    auto request_mr = std::make_shared<rdmapp::local_mr>(
+        qp->pd_ptr()->reg_mr(&request_buffer, sizeof(request_buffer)));
     constexpr std::size_t kAckRingSize = 128;
     std::vector<AckWire> ack_ring(kAckRingSize);
     std::vector<std::shared_ptr<rdmapp::local_mr>> ack_mrs;
@@ -577,7 +621,9 @@ asio::awaitable<void> handle_client(std::shared_ptr<AcceptedClient> client,
     std::size_t ack_slot_id = 0;
 
     while (true) {
-        RequestWire req = raw_recv_pod_wait<RequestWire>(qp, "request");
+        raw_recv_mr_wait(
+            qp, *request_mr, sizeof(request_buffer), "request");
+        RequestWire req = request_buffer;
         if (req.magic != promptdb_rdma::kRequestMagic ||
             req.version != promptdb_rdma::kProtocolVersion) {
             throw std::runtime_error("bad request header");
@@ -591,7 +637,7 @@ asio::awaitable<void> handle_client(std::shared_ptr<AcceptedClient> client,
             ack = AckWire{};
             ack.status = static_cast<std::uint16_t>(Status::bad_request);
             ack.request_id = req.request_id;
-            post_ack_without_wait(qp, *ack_mrs[slot]);
+            write_ack_with_imm_wait(qp, ack_remote, *ack_mrs[slot], ack);
             continue;
         }
 
@@ -650,7 +696,7 @@ asio::awaitable<void> handle_client(std::shared_ptr<AcceptedClient> client,
             ack.best_idx = -1;
         }
 
-        post_ack_without_wait(qp, *ack_mrs[slot]);
+        write_ack_with_imm_wait(qp, ack_remote, *ack_mrs[slot], ack);
     }
 }
 
