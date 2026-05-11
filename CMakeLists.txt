@@ -98,4 +98,40 @@ if(RDMAPY_BUILD_CXX_BENCHES)
     else()
         message(STATUS "CUDAToolkit not found: rdma_prompt_read_latency will support --memory host only")
     endif()
+
+    add_executable(rdma_promptdb_server
+        examples/rdma_promptdb_server.cc
+        src/promptdb_lsh.hpp
+    )
+
+    target_compile_features(rdma_promptdb_server PRIVATE cxx_std_20)
+
+    target_include_directories(rdma_promptdb_server
+        PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${RDMAPP_DIR}/examples/include
+    )
+
+    target_link_libraries(rdma_promptdb_server
+        PRIVATE
+        rdmapp_qp_helpers
+    )
+
+    add_executable(rdma_promptdb_find_latency
+        examples/rdma_promptdb_find_latency.cc
+        src/promptdb_lsh.hpp
+    )
+
+    target_compile_features(rdma_promptdb_find_latency PRIVATE cxx_std_20)
+
+    target_include_directories(rdma_promptdb_find_latency
+        PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${RDMAPP_DIR}/examples/include
+    )
+
+    target_link_libraries(rdma_promptdb_find_latency
+        PRIVATE
+        rdmapp_qp_helpers
+    )
 endif()

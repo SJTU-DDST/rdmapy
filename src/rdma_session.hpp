@@ -1047,6 +1047,14 @@ public:
         cq_poller_.reset();
     }
 
+    void stop_background_workers() {
+        cq_poller_.reset();
+        if (io_ctx_) {
+            io_ctx_->stop();
+        }
+        workers_.clear();
+    }
+
     std::shared_ptr<RdmaSession> connect(const std::string& host,
                                          uint16_t port)
     {

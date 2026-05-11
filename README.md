@@ -258,8 +258,78 @@ raw-poll 对 CPU 调度非常敏感。`--cpu-list` 会把第 N 个 worker 固定
 RDMA 网卡、GPU 在同一个 NUMA node 上的物理核，避免使用 SMT sibling。
 也可以用 `--auto-cpu-list --cpu-candidates ...` 先在候选 CPU 上逐个测
 单线程延迟，再自动选出最快的 `--max-threads` 个 CPU 做正式测试。
+raw-poll 正式测试前也会停止 endpoint 的后台 CQ poller 和 `io_context`
+线程，避免额外线程影响调度。
+
+如果要把 worker 分摊到多个 RDMA port/device，可以使用 endpoint 列表。
+这些列表按 worker id 轮询匹配；长度为 1 的列表会广播到所有 worker：
+
+```bash
+./build/rdma_prompt_read_latency \
+  --server-endpoints 192.168.98.70:2334,192.168.98.70:2335 \
+  --ib-devices 0,0 \
+  --ib-ports 1,2 \
+  --cpu-list 0,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30
+```
 
 更详细的 GDR 说明见 [`GDR_USAGE.md`](GDR_USAGE.md)。
+
+## C++ RDMA PromptDB / LSH 延迟测试
+
+`PromptDatabaseServer.py` 里的 LSH bucket、`RandomState(seed).rand(...)`
+hash 矩阵、`zlib.crc32(str(signature)) % 20000`、Jaccard overlap
+匹配逻辑已经有对应的 C++ 实现。RDMA 数据路径为：
+
+1. client 暴露 prompt/result 两块 MR 给 server。
+2. 每次查询 client 只发一个小的 control request。
+3. server 用 RDMA READ 从 client prompt MR 拉取当前 prompt。
+4. server 在本地 C++ PromptDB 中执行 `find_most_similar_prompt`。
+5. server 用 RDMA WRITE 把 result header + best token 写回 client result MR，
+   再发一个小 ACK 通知完成。
+
+构建：
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DRDMAPY_BUILD_PYTHON=OFF
+cmake --build build -j --target rdma_promptdb_server rdma_promptdb_find_latency
+```
+
+启动 server：
+
+```bash
+./build/rdma_promptdb_server \
+  --port 2333 \
+  --ib-device 0 \
+  --ib-port 1 \
+  --prompts 4096 \
+  --token-len 32 \
+  --vocab-size 32000 \
+  --bucket-size 8 \
+  --seed 42
+```
+
+运行 1 到 16 线程测试：
+
+```bash
+./build/rdma_promptdb_find_latency \
+  --host <server-ip> \
+  --port 2333 \
+  --ib-device 0 \
+  --ib-port 1 \
+  --prompts 4096 \
+  --token-len 32 \
+  --vocab-size 32000 \
+  --seed 42 \
+  --min-threads 1 \
+  --max-threads 16 \
+  --repeats 100 \
+  --warmup 10 \
+  --trials 1
+```
+
+server 和 client 的 `--prompts/--token-len/--vocab-size/--seed` 要保持一致，
+这样 benchmark 查询的是 server 预填充的同一批 prompt。输出默认是
+`threads,avg_us`，加 `--verbose` 会额外输出 p50/p95/p99。
 
 ## 常见问题
 

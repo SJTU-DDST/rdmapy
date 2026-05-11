@@ -50,6 +50,10 @@ struct Options {
     std::uint16_t port = 2333;
     int ib_port = 1;
     int ib_device = 1;
+    std::vector<std::string> server_hosts;
+    std::vector<std::uint16_t> server_ports;
+    std::vector<int> ib_ports;
+    std::vector<int> ib_devices;
     int cuda_device = 0;
     std::string memory = kDefaultMemory;
     std::uint64_t offset = 0;
@@ -80,6 +84,11 @@ struct Options {
     std::string rdma_log_level = "warn";
     std::string completion_mode = "raw-poll";
 };
+
+template <typename T>
+const T& pick_round_robin(const std::vector<T>& values, std::size_t index) {
+    return values.size() == 1 ? values[0] : values[index % values.size()];
+}
 
 [[noreturn]] void usage_error(const std::string& message) {
     throw std::runtime_error("argument error: " + message);
@@ -180,17 +189,19 @@ std::string take_value(int& index, int argc, char* argv[], const std::string& fl
     return argv[++index];
 }
 
-int parse_cpu_id(const std::string& text) {
+int parse_nonnegative_id(const std::string& name, const std::string& text) {
     return static_cast<int>(
-        parse_ll("CPU id", text, 0, std::numeric_limits<int>::max()));
+        parse_ll(name, text, 0, std::numeric_limits<int>::max()));
 }
 
-std::vector<int> parse_cpu_list(const std::string& text) {
+std::vector<int> parse_nonnegative_int_list(
+    const std::string& text,
+    const std::string& flag) {
     if (text.empty()) {
-        usage_error("--cpu-list cannot be empty");
+        usage_error(flag + " cannot be empty");
     }
 
-    std::vector<int> cpus;
+    std::vector<int> values;
     std::size_t start = 0;
     while (start <= text.size()) {
         std::size_t comma = text.find(',', start);
@@ -198,23 +209,25 @@ std::vector<int> parse_cpu_list(const std::string& text) {
             start,
             comma == std::string::npos ? std::string::npos : comma - start);
         if (item.empty()) {
-            usage_error("empty item in --cpu-list");
+            usage_error("empty item in " + flag);
         }
 
         std::size_t dash = item.find('-');
         if (dash == std::string::npos) {
-            cpus.push_back(parse_cpu_id(item));
+            values.push_back(parse_nonnegative_id(flag + " item", item));
         } else {
             if (item.find('-', dash + 1) != std::string::npos) {
-                usage_error("invalid CPU range in --cpu-list: " + item);
+                usage_error("invalid range in " + flag + ": " + item);
             }
-            int first = parse_cpu_id(item.substr(0, dash));
-            int last = parse_cpu_id(item.substr(dash + 1));
+            int first = parse_nonnegative_id(flag + " range start",
+                                             item.substr(0, dash));
+            int last = parse_nonnegative_id(flag + " range end",
+                                            item.substr(dash + 1));
             if (first > last) {
-                usage_error("descending CPU range in --cpu-list: " + item);
+                usage_error("descending range in " + flag + ": " + item);
             }
-            for (int cpu = first; cpu <= last; ++cpu) {
-                cpus.push_back(cpu);
+            for (int value = first; value <= last; ++value) {
+                values.push_back(value);
             }
         }
 
@@ -224,7 +237,51 @@ std::vector<int> parse_cpu_list(const std::string& text) {
         start = comma + 1;
     }
 
-    return cpus;
+    return values;
+}
+
+std::vector<int> parse_cpu_list(const std::string& text) {
+    return parse_nonnegative_int_list(text, "--cpu-list");
+}
+
+void parse_server_endpoints(
+    const std::string& text,
+    std::vector<std::string>& hosts,
+    std::vector<std::uint16_t>& ports) {
+    if (text.empty()) {
+        usage_error("--server-endpoints cannot be empty");
+    }
+
+    hosts.clear();
+    ports.clear();
+    std::size_t start = 0;
+    while (start <= text.size()) {
+        std::size_t comma = text.find(',', start);
+        std::string item = text.substr(
+            start,
+            comma == std::string::npos ? std::string::npos : comma - start);
+        if (item.empty()) {
+            usage_error("empty item in --server-endpoints");
+        }
+
+        std::size_t colon = item.rfind(':');
+        if (colon == std::string::npos || colon == 0 ||
+            colon + 1 == item.size()) {
+            usage_error(
+                "--server-endpoints items must be HOST:PORT: " + item);
+        }
+        hosts.push_back(item.substr(0, colon));
+        ports.push_back(static_cast<std::uint16_t>(
+            parse_ll("--server-endpoints port",
+                     item.substr(colon + 1),
+                     1,
+                     65535)));
+
+        if (comma == std::string::npos) {
+            break;
+        }
+        start = comma + 1;
+    }
 }
 
 bool has_duplicates(std::vector<int> values) {
@@ -241,6 +298,9 @@ void print_usage(const char* prog) {
         << "  --port PORT                 default: 2333\n"
         << "  --ib-port PORT              default: 1\n"
         << "  --ib-device DEVICE          default: 1\n"
+        << "  --server-endpoints LIST     HOST:PORT[,HOST:PORT...]\n"
+        << "  --ib-ports LIST             RDMA port list, e.g. 1,2\n"
+        << "  --ib-devices LIST           RDMA device list, e.g. 0,1\n"
         << "  --memory cuda|host          default: " << kDefaultMemory << "\n"
         << "  --cuda-device DEVICE        default: 0\n"
         << "  --offset BYTES              default: 0\n"
@@ -299,6 +359,17 @@ Options parse_args(int argc, char* argv[]) {
             opts.ib_device = static_cast<int>(
                 parse_ll(arg, take_value(i, argc, argv, arg), 0,
                          std::numeric_limits<int>::max()));
+        } else if (arg == "--server-endpoints") {
+            parse_server_endpoints(
+                take_value(i, argc, argv, arg),
+                opts.server_hosts,
+                opts.server_ports);
+        } else if (arg == "--ib-ports") {
+            opts.ib_ports =
+                parse_nonnegative_int_list(take_value(i, argc, argv, arg), arg);
+        } else if (arg == "--ib-devices") {
+            opts.ib_devices =
+                parse_nonnegative_int_list(take_value(i, argc, argv, arg), arg);
         } else if (arg == "--memory") {
             opts.memory = lower_copy(take_value(i, argc, argv, arg));
         } else if (arg == "--cuda-device") {
@@ -410,6 +481,37 @@ Options parse_args(int argc, char* argv[]) {
             static_cast<std::uint64_t>(opts.prompt_tokens) *
             static_cast<std::uint64_t>(opts.token_bytes);
     }
+
+    if (opts.server_hosts.empty()) {
+        opts.server_hosts.push_back(opts.host);
+        opts.server_ports.push_back(opts.port);
+    }
+    if (opts.ib_devices.empty()) {
+        opts.ib_devices.push_back(opts.ib_device);
+    }
+    if (opts.ib_ports.empty()) {
+        opts.ib_ports.push_back(opts.ib_port);
+    }
+    for (int port : opts.ib_ports) {
+        if (port < 1) {
+            usage_error("--ib-ports values must be >= 1");
+        }
+    }
+    std::size_t endpoint_configs = std::max(
+        std::max(opts.server_hosts.size(), opts.ib_devices.size()),
+        opts.ib_ports.size());
+    auto validate_broadcastable = [&](std::size_t size,
+                                      const std::string& name) {
+        if (size != 1 && size != endpoint_configs) {
+            usage_error(
+                name + " must contain either 1 item or the same number of "
+                "items as the largest endpoint list");
+        }
+    };
+    validate_broadcastable(opts.server_hosts.size(), "--server-endpoints");
+    validate_broadcastable(opts.server_ports.size(), "--server-endpoints");
+    validate_broadcastable(opts.ib_devices.size(), "--ib-devices");
+    validate_broadcastable(opts.ib_ports.size(), "--ib-ports");
 
     if (opts.memory != "cuda" && opts.memory != "host") {
         usage_error("--memory must be cuda or host");
@@ -675,11 +777,11 @@ public:
         if (opts_.endpoint_per_thread) {
             endpoints_.reserve(static_cast<std::size_t>(workers));
             for (int worker_id = 0; worker_id < workers; ++worker_id) {
-                endpoints_.push_back(make_endpoint());
+                endpoints_.push_back(make_endpoint(worker_id));
                 add_worker(worker_id, *endpoints_.back());
             }
         } else {
-            shared_endpoint_ = make_endpoint();
+            shared_endpoint_ = make_endpoint(0);
             for (int worker_id = 0; worker_id < workers; ++worker_id) {
                 add_worker(worker_id, *shared_endpoint_);
             }
@@ -689,7 +791,7 @@ public:
             prime_worker(worker);
         }
         if (opts_.completion_mode == "raw-poll") {
-            stop_cq_pollers();
+            stop_background_workers();
         }
     }
 
@@ -813,16 +915,32 @@ public:
     }
 
 private:
-    std::unique_ptr<RdmaEndpoint> make_endpoint() const {
+    std::size_t endpoint_config_count() const {
+        return std::max(
+            std::max(opts_.server_hosts.size(), opts_.ib_devices.size()),
+            opts_.ib_ports.size());
+    }
+
+    std::unique_ptr<RdmaEndpoint> make_endpoint(int worker_id) const {
+        std::size_t config_id =
+            static_cast<std::size_t>(worker_id) % endpoint_config_count();
+        int ib_device = pick_round_robin(opts_.ib_devices, config_id);
+        int ib_port = pick_round_robin(opts_.ib_ports, config_id);
         return std::make_unique<RdmaEndpoint>(
-            opts_.ib_port,
-            opts_.ib_device,
+            ib_port,
+            ib_device,
             static_cast<std::uint32_t>(opts_.io_workers),
             opts_.cq_batch_size);
     }
 
     void add_worker(int worker_id, RdmaEndpoint& endpoint) {
-        auto session = endpoint.connect(opts_.host, opts_.port);
+        std::size_t config_id =
+            static_cast<std::size_t>(worker_id) % endpoint_config_count();
+        const std::string& host =
+            pick_round_robin(opts_.server_hosts, config_id);
+        std::uint16_t port =
+            pick_round_robin(opts_.server_ports, config_id);
+        auto session = endpoint.connect(host, port);
         session->set_mr_cache_limit(opts_.mr_cache_limit);
         WorkerState worker;
         worker.session = std::move(session);
@@ -846,12 +964,12 @@ private:
             opts_.debug);
     }
 
-    void stop_cq_pollers() {
+    void stop_background_workers() {
         if (shared_endpoint_) {
-            shared_endpoint_->stop_cq_poller();
+            shared_endpoint_->stop_background_workers();
         }
         for (auto& endpoint : endpoints_) {
-            endpoint->stop_cq_poller();
+            endpoint->stop_background_workers();
         }
     }
 
