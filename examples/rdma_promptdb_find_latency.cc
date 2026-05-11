@@ -410,8 +410,6 @@ struct RawRecvState {
     std::shared_ptr<rdmapp::qp> qp;
     std::uint32_t expected_bytes = 0;
     const char* what = "recv";
-    bool check_bytes = true;
-    bool expect_imm = false;
 };
 
 RawRecvState raw_post_recv_mr(std::shared_ptr<rdmapp::qp> qp,
@@ -431,21 +429,7 @@ RawRecvState raw_post_recv_mr(std::shared_ptr<rdmapp::qp> qp,
     recv_wr.sg_list = &sge;
 
     qp->post_recv(recv_wr, bad_recv_wr);
-    return RawRecvState{
-        std::move(qp), expected_bytes, what, true, false};
-}
-
-RawRecvState raw_post_recv_imm(std::shared_ptr<rdmapp::qp> qp,
-                               const char* what) {
-    struct ibv_recv_wr recv_wr = {};
-    struct ibv_recv_wr* bad_recv_wr = nullptr;
-    recv_wr.next = nullptr;
-    recv_wr.wr_id = 2;
-    recv_wr.num_sge = 0;
-    recv_wr.sg_list = nullptr;
-
-    qp->post_recv(recv_wr, bad_recv_wr);
-    return RawRecvState{std::move(qp), 0, what, false, true};
+    return RawRecvState{std::move(qp), expected_bytes, what};
 }
 
 void raw_wait_recv(const RawRecvState& state) {
@@ -458,14 +442,7 @@ void raw_wait_recv(const RawRecvState& state) {
             ibv_wc_status_str(wc.status) +
             " (status=" + std::to_string(static_cast<int>(wc.status)) + ")");
     }
-    if (state.expect_imm &&
-        (wc.opcode != IBV_WC_RECV_RDMA_WITH_IMM ||
-         !(wc.wc_flags & IBV_WC_WITH_IMM))) {
-        throw std::runtime_error(
-            std::string("expected RDMA write-with-imm completion for ") +
-            state.what);
-    }
-    if (state.check_bytes && wc.byte_len != state.expected_bytes) {
+    if (wc.byte_len != state.expected_bytes) {
         throw std::runtime_error(
             std::string("short raw recv for ") + state.what + ": got " +
             std::to_string(wc.byte_len) + " expected " +
@@ -701,7 +678,8 @@ public:
         request_buffer_.token_count =
             static_cast<std::uint32_t>(tokens.size());
 
-        auto ack_state = raw_post_recv_imm(qp_, "ack write-with-imm");
+        auto ack_state = raw_post_recv_mr(
+            qp_, *ack_mr_, sizeof(ack_buffer_), "ack");
         auto t0 = std::chrono::steady_clock::now();
         std::atomic_thread_fence(std::memory_order_release);
         const bool signal_request =
@@ -742,8 +720,6 @@ private:
         raw_send_bytes_wait(qp_, prompt_serialized);
         auto result_serialized = result_mr_->serialize();
         raw_send_bytes_wait(qp_, result_serialized);
-        auto ack_serialized = ack_mr_->serialize();
-        raw_send_bytes_wait(qp_, ack_serialized);
         raw_wait_recv(resp_state);
 
         if (resp.magic != promptdb_rdma::kServerHelloMagic ||
@@ -938,7 +914,7 @@ int main(int argc, char* argv[]) {
             << " trials=" << opts.trials
             << " thread_gap_ms=" << opts.thread_gap_ms
             << " sync_each_repeat=" << (opts.sync_each_repeat ? "true" : "false")
-            << " data_path=send_request_rdma_read_prompt_rdma_write_result_ack_write_imm\n";
+            << " data_path=send_request_rdma_read_prompt_rdma_write_result_send_ack\n";
         if (opts.verbose) {
             std::cout
                 << "threads,total_avg_us,total_p50_us,total_p95_us,total_p99_us,"

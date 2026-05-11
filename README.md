@@ -280,12 +280,12 @@ raw-poll 正式测试前也会停止 endpoint 的后台 CQ poller 和 `io_contex
 hash 矩阵、`zlib.crc32(str(signature)) % 20000`、Jaccard overlap
 匹配逻辑已经有对应的 C++ 实现。RDMA 数据路径为：
 
-1. client 暴露 prompt/result/ack 三块 MR 给 server。
+1. client 暴露 prompt/result 两块 MR 给 server。
 2. 每次查询 client 用预注册 request buffer 发一个小的 control request。
 3. server 用 RDMA READ 从 client prompt MR 拉取当前 prompt。
 4. server 在本地 C++ PromptDB 中执行 `find_most_similar_prompt`。
 5. server 用 RDMA WRITE 把 result header + best token 写回 client result MR，
-   再用 RDMA WRITE_WITH_IMM 把 ACK 写到 client ack MR 并通知完成。
+   再用预注册 ACK buffer 发一个 SEND 通知完成。
 
 构建：
 
@@ -338,7 +338,7 @@ server 和 client 的 `--prompts/--token-len/--vocab-size/--seed` 要保持一�
 - `server_match_avg_us`：server 执行 C++ LSH/Jaccard 匹配的时间。
 - `result_transfer_avg_us`：server 用 RDMA WRITE 把 best prompt/result 写回
   计算节点 result MR 的时间。
-- `client_overhead_avg_us`：request SEND、ACK write-with-imm 通知、CQ polling
+- `client_overhead_avg_us`：request SEND、ACK SEND/RECV 通知、CQ polling
   和其余没有归入上面三个 server 计时段的软件开销。
 
 加 `--verbose` 会额外输出 total 的 p50/p95/p99 和各阶段 p50。
