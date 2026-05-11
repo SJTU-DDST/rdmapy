@@ -2,16 +2,18 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <cstdint>
 #include <cstring>
 #include <deque>
 #include <limits>
 #include <optional>
 #include <sstream>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <unordered_set>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -218,17 +220,41 @@ struct FindResult {
     std::vector<std::uint32_t> best_tokens;
 };
 
-inline double overlap_score(const std::vector<std::uint32_t>& a,
-                            const std::vector<std::uint32_t>& b) {
-    std::unordered_set<std::uint32_t> set_a(a.begin(), a.end());
-    std::unordered_set<std::uint32_t> set_b(b.begin(), b.end());
+inline bool contains_token(std::span<const std::uint32_t> values,
+                           std::uint32_t needle) {
+    return std::find(values.begin(), values.end(), needle) != values.end();
+}
+
+inline bool seen_before(std::span<const std::uint32_t> values,
+                        std::size_t pos) {
+    return std::find(values.begin(), values.begin() +
+                                      static_cast<std::ptrdiff_t>(pos),
+                     values[pos]) != values.begin() +
+                                     static_cast<std::ptrdiff_t>(pos);
+}
+
+inline std::size_t unique_count(std::span<const std::uint32_t> values) {
+    std::size_t count = 0;
+    for (std::size_t i = 0; i < values.size(); ++i) {
+        if (!seen_before(values, i)) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+inline double overlap_score(std::span<const std::uint32_t> a,
+                            std::span<const std::uint32_t> b) {
     std::size_t intersection = 0;
-    for (std::uint32_t token : set_a) {
-        if (set_b.find(token) != set_b.end()) {
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        if (seen_before(a, i)) {
+            continue;
+        }
+        if (contains_token(b, a[i])) {
             ++intersection;
         }
     }
-    const std::size_t uni = set_a.size() + set_b.size() - intersection;
+    const std::size_t uni = unique_count(a) + unique_count(b) - intersection;
     return uni == 0 ? 0.0
                     : static_cast<double>(intersection) /
                           static_cast<double>(uni);
@@ -318,24 +344,20 @@ public:
 
     FindResult find_most_similar_prompt(
         const std::vector<std::uint32_t>& input_tokens) const {
+        return find_most_similar_prompt(std::span<const std::uint32_t>(
+            input_tokens.data(), input_tokens.size()));
+    }
+
+    FindResult find_most_similar_prompt(
+        std::span<const std::uint32_t> input_tokens) const {
         const int bucket_id = get_bucket_id(input_tokens);
 
-        std::vector<int> fallback_candidates;
         const std::deque<int>* bucket_candidates = nullptr;
         if (bucket_id != -1) {
             const auto& bucket =
                 lsh_buckets_[static_cast<std::size_t>(bucket_id)];
             if (!bucket.empty()) {
                 bucket_candidates = &bucket;
-            }
-        }
-
-        if (bucket_candidates == nullptr) {
-            fallback_candidates.reserve(static_cast<std::size_t>(num_prompts_));
-            for (int i = 0; i < config_.prompts_len; ++i) {
-                if (alive_[static_cast<std::size_t>(i)]) {
-                    fallback_candidates.push_back(i);
-                }
             }
         }
 
@@ -349,7 +371,9 @@ public:
             if (tokens.size() != input_tokens.size()) {
                 return;
             }
-            const double score = overlap_score(input_tokens, tokens);
+            const double score = overlap_score(
+                input_tokens,
+                std::span<const std::uint32_t>(tokens.data(), tokens.size()));
             if (score > result.best_score) {
                 result.best_score = score;
                 result.best_idx = idx;
@@ -362,8 +386,10 @@ public:
                 visit_candidate(idx);
             }
         } else {
-            for (int idx : fallback_candidates) {
-                visit_candidate(idx);
+            for (int idx = 0; idx < config_.prompts_len; ++idx) {
+                if (alive_[static_cast<std::size_t>(idx)]) {
+                    visit_candidate(idx);
+                }
             }
         }
 
@@ -371,11 +397,15 @@ public:
     }
 
     int get_bucket_id(const std::vector<std::uint32_t>& token_ids) const {
-        const auto signature = hash_tokens(token_ids);
-        if (signature.empty()) {
+        return get_bucket_id(
+            std::span<const std::uint32_t>(token_ids.data(), token_ids.size()));
+    }
+
+    int get_bucket_id(std::span<const std::uint32_t> token_ids) const {
+        const std::string py_string = signature_to_python_string(token_ids);
+        if (py_string.empty()) {
             return -1;
         }
-        const std::string py_string = signature_to_python_string(signature);
         return static_cast<int>(
             zlib_crc32(py_string) %
             static_cast<std::uint32_t>(config_.num_buckets));
@@ -439,6 +469,131 @@ public:
     }
 
 private:
+    static void append_uint32(std::string& out, std::uint32_t value) {
+        char buffer[16];
+        auto [ptr, ec] = std::to_chars(
+            buffer, buffer + sizeof(buffer), value);
+        if (ec != std::errc()) {
+            throw std::runtime_error("failed to format uint32");
+        }
+        out.append(buffer, ptr);
+    }
+
+    std::string signature_to_python_string(
+        std::span<const std::uint32_t> token_ids) const {
+        bool all_valid = true;
+        for (std::uint32_t token : token_ids) {
+            if (token >= static_cast<std::uint32_t>(config_.vocab_size)) {
+                all_valid = false;
+                break;
+            }
+        }
+
+        if (all_valid) {
+            return signature_to_python_string_for_valid_tokens(token_ids);
+        }
+
+        std::vector<std::uint32_t> filtered;
+        filtered.reserve(token_ids.size());
+        for (std::uint32_t token : token_ids) {
+            if (token < static_cast<std::uint32_t>(config_.vocab_size)) {
+                filtered.push_back(token);
+            }
+        }
+        return signature_to_python_string_for_valid_tokens(
+            std::span<const std::uint32_t>(filtered.data(), filtered.size()));
+    }
+
+    std::string signature_to_python_string_for_valid_tokens(
+        std::span<const std::uint32_t> tokens) const {
+        if (tokens.empty()) {
+            return {};
+        }
+
+        const std::size_t n = tokens.size();
+        const std::size_t current_l = std::min<std::size_t>(
+            static_cast<std::size_t>(config_.signature_tokens), n);
+        static constexpr std::size_t kStackSignatureTokens = 64;
+        std::array<std::size_t, kStackSignatureTokens> stack_positions{};
+        std::array<double, kStackSignatureTokens> stack_values{};
+        std::vector<std::size_t> heap_positions;
+        std::vector<double> heap_values;
+        std::span<std::size_t> best_positions;
+        std::span<double> best_values;
+        if (current_l <= kStackSignatureTokens) {
+            best_positions =
+                std::span<std::size_t>(stack_positions.data(), current_l);
+            best_values = std::span<double>(stack_values.data(), current_l);
+        } else {
+            heap_positions.resize(current_l);
+            heap_values.resize(current_l);
+            best_positions =
+                std::span<std::size_t>(heap_positions.data(), current_l);
+            best_values = std::span<double>(heap_values.data(), current_l);
+        }
+
+        std::string out;
+        out.reserve(static_cast<std::size_t>(config_.num_hashes) *
+                    (current_l * 12 + 4) + 2);
+        out.push_back('(');
+
+        for (int h = 0; h < config_.num_hashes; ++h) {
+            if (h != 0) {
+                out.append(", ");
+            }
+
+            const std::size_t row =
+                static_cast<std::size_t>(h) *
+                static_cast<std::size_t>(config_.vocab_size);
+            std::size_t best_count = 0;
+            for (std::size_t pos = 0; pos < n; ++pos) {
+                const double value =
+                    hash_matrix_[row + static_cast<std::size_t>(tokens[pos])];
+                if (best_count < current_l) {
+                    best_values[best_count] = value;
+                    best_positions[best_count] = pos;
+                    ++best_count;
+                    continue;
+                }
+
+                std::size_t worst = 0;
+                for (std::size_t i = 1; i < current_l; ++i) {
+                    if (best_values[worst] < best_values[i] ||
+                        (best_values[worst] == best_values[i] &&
+                         best_positions[worst] < best_positions[i])) {
+                        worst = i;
+                    }
+                }
+                if (value < best_values[worst] ||
+                    (value == best_values[worst] &&
+                     pos < best_positions[worst])) {
+                    best_values[worst] = value;
+                    best_positions[worst] = pos;
+                }
+            }
+
+            std::sort(best_positions.begin(), best_positions.end());
+
+            out.push_back('(');
+            for (std::size_t i = 0; i < current_l; ++i) {
+                if (i != 0) {
+                    out.append(", ");
+                }
+                append_uint32(out, tokens[best_positions[i]]);
+            }
+            if (current_l == 1) {
+                out.push_back(',');
+            }
+            out.push_back(')');
+        }
+
+        if (config_.num_hashes == 1) {
+            out.push_back(',');
+        }
+        out.push_back(')');
+        return out;
+    }
+
     static std::string signature_to_python_string(
         const std::vector<std::vector<std::uint32_t>>& signature) {
         std::ostringstream out;

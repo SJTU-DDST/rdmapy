@@ -622,10 +622,8 @@ void handle_client(std::shared_ptr<AcceptedClient> client,
                 prompt_buffer.data(),
                 prompt_bytes);
 
-            std::vector<std::uint32_t> tokens(
-                prompt_buffer.begin(),
-                prompt_buffer.begin() +
-                    static_cast<std::ptrdiff_t>(req.token_count));
+            std::span<const std::uint32_t> tokens(
+                prompt_buffer.data(), req.token_count);
             const auto match_start = std::chrono::steady_clock::now();
             FindResult result = db->find_most_similar_prompt(tokens);
             const auto match_end = std::chrono::steady_clock::now();
