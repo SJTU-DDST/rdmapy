@@ -301,7 +301,7 @@ cmake --build build -j --target rdma_promptdb_server rdma_promptdb_find_latency
   --port 2333 \
   --ib-device 0 \
   --ib-port 1 \
-  --io-threads 4 \
+  --io-threads 32 \
   --prompts 4096 \
   --token-len 32 \
   --vocab-size 32000 \
@@ -347,6 +347,9 @@ server 和 client 的 `--prompts/--token-len/--vocab-size/--seed` 要保持一�
 worker 同时发起请求”的 burst 压测时再加 `--sync-each-repeat` 或
 `--round-sync`。如果要降低 CPU 调度抖动，可以像 C++ READ benchmark 一样
 加 `--cpu-list 0-15`，把第 N 个 worker 绑到列表里的第 N 个 CPU。
+PromptDB server 的数据面和控制面都使用 raw-poll；server handler 会占用
+`io_context` 线程等待请求，所以 `--io-threads` 应大于最大并发连接数，
+例如 16 个 client worker 时建议 server 设为 `--io-threads 32`。
 
 ## 常见问题
 

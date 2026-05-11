@@ -198,6 +198,10 @@ bool qp::poll_send_cq(struct ibv_wc &wc) {
   return send_cq_->poll(wc);
 }
 
+bool qp::poll_recv_cq(struct ibv_wc &wc) {
+  return recv_cq_->poll(wc);
+}
+
 void qp::post_recv(struct ibv_recv_wr const &recv_wr,
                    struct ibv_recv_wr *&bad_recv_wr) const {
   (this->*(post_recv_fn))(recv_wr, bad_recv_wr);

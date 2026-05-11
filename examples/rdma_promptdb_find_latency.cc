@@ -372,6 +372,50 @@ void raw_send_mr_wait(std::shared_ptr<rdmapp::qp> qp,
     }
 }
 
+struct RawRecvState {
+    std::shared_ptr<rdmapp::qp> qp;
+    std::uint32_t expected_bytes = 0;
+    const char* what = "recv";
+};
+
+RawRecvState raw_post_recv_mr(std::shared_ptr<rdmapp::qp> qp,
+                              const rdmapp::local_mr& local_mr,
+                              std::uint32_t expected_bytes,
+                              const char* what) {
+    struct ibv_sge sge = {};
+    sge.addr = reinterpret_cast<std::uint64_t>(local_mr.addr());
+    sge.length = expected_bytes;
+    sge.lkey = local_mr.lkey();
+
+    struct ibv_recv_wr recv_wr = {};
+    struct ibv_recv_wr* bad_recv_wr = nullptr;
+    recv_wr.next = nullptr;
+    recv_wr.wr_id = 1;
+    recv_wr.num_sge = 1;
+    recv_wr.sg_list = &sge;
+
+    qp->post_recv(recv_wr, bad_recv_wr);
+    return RawRecvState{std::move(qp), expected_bytes, what};
+}
+
+void raw_wait_recv(const RawRecvState& state) {
+    struct ibv_wc wc = {};
+    while (!state.qp->poll_recv_cq(wc)) {
+    }
+    if (wc.status != IBV_WC_SUCCESS) {
+        throw std::runtime_error(
+            std::string("raw recv failed for ") + state.what + ": " +
+            ibv_wc_status_str(wc.status) +
+            " (status=" + std::to_string(static_cast<int>(wc.status)) + ")");
+    }
+    if (wc.byte_len != state.expected_bytes) {
+        throw std::runtime_error(
+            std::string("short raw recv for ") + state.what + ": got " +
+            std::to_string(wc.byte_len) + " expected " +
+            std::to_string(state.expected_bytes));
+    }
+}
+
 template <typename T>
 void raw_send_pod_wait(std::shared_ptr<rdmapp::qp> qp, const T& value) {
     auto mr = std::make_shared<rdmapp::local_mr>(
@@ -539,9 +583,6 @@ public:
           recv_cq_(std::make_shared<rdmapp::cq>(device_)),
           send_cq_(std::make_shared<rdmapp::cq>(device_)),
           io_ctx_(std::make_shared<asio::io_context>(opts.io_workers)),
-          executor_(std::make_shared<rdmapp::executor>(io_ctx_)),
-          recv_cq_poller_(std::make_shared<rdmapp::cq_poller>(
-              recv_cq_, executor_, opts.cq_batch_size)),
           prompt_buffer_(static_cast<std::size_t>(opts.max_tokens), 0),
           result_buffer_(promptdb_rdma::result_bytes_for_tokens(
               static_cast<std::uint32_t>(opts.max_tokens)),
@@ -575,6 +616,9 @@ public:
             throw std::runtime_error("failed to connect RDMA QP");
         }
         handshake();
+        work_guard_.reset();
+        io_ctx_->stop();
+        io_threads_.clear();
     }
 
     ~PromptDbConnection() {
@@ -597,10 +641,12 @@ public:
         req.request_id = request_id;
         req.token_count = static_cast<std::uint32_t>(tokens.size());
 
-        auto ack_state = post_ack_recv();
+        auto ack_state = raw_post_recv_mr(
+            qp_, *ack_mr_, sizeof(ack_buffer_), "ack");
         auto t0 = std::chrono::steady_clock::now();
         raw_send_pod_wait(qp_, req);
-        AckWire ack = wait_ack(ack_state);
+        raw_wait_recv(ack_state);
+        AckWire ack = ack_buffer_;
         auto t1 = std::chrono::steady_clock::now();
 
         validate_ack_and_result(ack, req.request_id);
@@ -614,78 +660,6 @@ public:
     }
 
 private:
-    struct AckRecvState {
-        std::mutex mutex;
-        std::condition_variable cv;
-        bool done = false;
-        std::uint32_t bytes = 0;
-        std::uint32_t expected_bytes = 0;
-        const char* what = "recv";
-        std::exception_ptr exception;
-    };
-
-    std::shared_ptr<AckRecvState> post_recv_mr(
-        const std::shared_ptr<rdmapp::local_mr>& mr,
-        std::uint32_t expected_bytes,
-        const char* what) {
-        auto state = std::make_shared<AckRecvState>();
-        state->expected_bytes = expected_bytes;
-        state->what = what;
-        auto callback = rdmapp::executor::make_callback(
-            [state](struct ibv_wc const& wc) {
-                {
-                    std::lock_guard<std::mutex> lk(state->mutex);
-                    state->bytes = wc.byte_len;
-                    if (wc.status != IBV_WC_SUCCESS) {
-                        state->exception = std::make_exception_ptr(
-                            std::runtime_error(
-                                std::string("failed to recv ") +
-                                state->what + ": " +
-                                ibv_wc_status_str(wc.status) +
-                                " (status=" +
-                                std::to_string(static_cast<int>(wc.status)) +
-                                ")"));
-                    }
-                    state->done = true;
-                }
-                state->cv.notify_one();
-            });
-
-        struct ibv_sge sge = {};
-        sge.addr = reinterpret_cast<std::uint64_t>(mr->addr());
-        sge.length = expected_bytes;
-        sge.lkey = mr->lkey();
-
-        struct ibv_recv_wr recv_wr = {};
-        struct ibv_recv_wr* bad_recv_wr = nullptr;
-        recv_wr.next = nullptr;
-        recv_wr.wr_id = reinterpret_cast<std::uint64_t>(callback);
-        recv_wr.num_sge = 1;
-        recv_wr.sg_list = &sge;
-
-        try {
-            qp_->post_recv(recv_wr, bad_recv_wr);
-        } catch (...) {
-            rdmapp::executor::destroy_callback(callback);
-            throw;
-        }
-        return state;
-    }
-
-    void wait_recv(const std::shared_ptr<AckRecvState>& state) {
-        std::unique_lock<std::mutex> lk(state->mutex);
-        state->cv.wait(lk, [&state] { return state->done; });
-        if (state->exception) {
-            std::rethrow_exception(state->exception);
-        }
-        if (state->bytes != state->expected_bytes) {
-            throw std::runtime_error(
-                std::string("short recv for ") + state->what + ": got " +
-                std::to_string(state->bytes) + " expected " +
-                std::to_string(state->expected_bytes));
-        }
-    }
-
     void handshake() {
         ClientHelloWire hello;
         hello.max_tokens = static_cast<std::uint32_t>(opts_.max_tokens);
@@ -694,29 +668,21 @@ private:
         ServerHelloWire resp{};
         auto resp_mr = std::make_shared<rdmapp::local_mr>(
             pd_->reg_mr(&resp, sizeof(resp)));
-        auto resp_state = post_recv_mr(resp_mr, sizeof(resp), "server hello");
+        auto resp_state =
+            raw_post_recv_mr(qp_, *resp_mr, sizeof(resp), "server hello");
 
         raw_send_pod_wait(qp_, hello);
         auto prompt_serialized = prompt_mr_->serialize();
         raw_send_bytes_wait(qp_, prompt_serialized);
         auto result_serialized = result_mr_->serialize();
         raw_send_bytes_wait(qp_, result_serialized);
-        wait_recv(resp_state);
+        raw_wait_recv(resp_state);
 
         if (resp.magic != promptdb_rdma::kServerHelloMagic ||
             resp.version != promptdb_rdma::kProtocolVersion ||
             resp.status != static_cast<std::uint16_t>(Status::ok)) {
             throw std::runtime_error("server rejected PromptDB RDMA handshake");
         }
-    }
-
-    std::shared_ptr<AckRecvState> post_ack_recv() {
-        return post_recv_mr(ack_mr_, sizeof(ack_buffer_), "ack");
-    }
-
-    AckWire wait_ack(const std::shared_ptr<AckRecvState>& state) {
-        wait_recv(state);
-        return ack_buffer_;
     }
 
     void close_noexcept() noexcept {
@@ -769,8 +735,6 @@ private:
     std::shared_ptr<rdmapp::cq> recv_cq_;
     std::shared_ptr<rdmapp::cq> send_cq_;
     std::shared_ptr<asio::io_context> io_ctx_;
-    std::shared_ptr<rdmapp::executor> executor_;
-    std::shared_ptr<rdmapp::cq_poller> recv_cq_poller_;
     std::shared_ptr<rdmapp::qp> qp_;
     std::vector<std::uint32_t> prompt_buffer_;
     std::vector<std::uint8_t> result_buffer_;

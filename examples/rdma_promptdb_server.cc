@@ -66,7 +66,6 @@ struct AcceptedClient {
     std::shared_ptr<rdmapp::qp> qp;
     std::shared_ptr<rdmapp::cq> recv_cq;
     std::shared_ptr<rdmapp::cq> send_cq;
-    std::shared_ptr<rdmapp::cq_poller> recv_poller;
 };
 
 class PromptDbAcceptor {
@@ -74,14 +73,10 @@ public:
     PromptDbAcceptor(std::shared_ptr<asio::io_context> io_ctx,
                      std::uint16_t port,
                      std::shared_ptr<rdmapp::pd> pd,
-                     std::shared_ptr<rdmapp::device> device,
-                     std::shared_ptr<rdmapp::executor> executor,
-                     std::size_t cq_batch_size)
+                     std::shared_ptr<rdmapp::device> device)
         : io_ctx_(std::move(io_ctx)),
           pd_(std::move(pd)),
           device_(std::move(device)),
-          executor_(std::move(executor)),
-          cq_batch_size_(cq_batch_size),
           acceptor_(*io_ctx_, {asio::ip::tcp::v4(), port}) {}
 
     asio::awaitable<std::shared_ptr<AcceptedClient>> accept() {
@@ -93,8 +88,6 @@ public:
             auto client = std::make_shared<AcceptedClient>();
             client->recv_cq = std::make_shared<rdmapp::cq>(device_);
             client->send_cq = std::make_shared<rdmapp::cq>(device_);
-            client->recv_poller = std::make_shared<rdmapp::cq_poller>(
-                client->recv_cq, executor_, cq_batch_size_);
             client->qp = std::make_shared<rdmapp::qp>(
                 remote_qp.header.lid,
                 remote_qp.header.qp_num,
@@ -116,8 +109,6 @@ private:
     std::shared_ptr<asio::io_context> io_ctx_;
     std::shared_ptr<rdmapp::pd> pd_;
     std::shared_ptr<rdmapp::device> device_;
-    std::shared_ptr<rdmapp::executor> executor_;
-    std::size_t cq_batch_size_;
     asio::ip::tcp::acceptor acceptor_;
 };
 
@@ -336,6 +327,40 @@ void raw_send_mr_wait(std::shared_ptr<rdmapp::qp> qp,
     }
 }
 
+void raw_recv_mr_wait(std::shared_ptr<rdmapp::qp> qp,
+                      const rdmapp::local_mr& local_mr,
+                      std::uint32_t expected_bytes,
+                      const char* what) {
+    struct ibv_sge sge = {};
+    sge.addr = reinterpret_cast<std::uint64_t>(local_mr.addr());
+    sge.length = expected_bytes;
+    sge.lkey = local_mr.lkey();
+
+    struct ibv_recv_wr recv_wr = {};
+    struct ibv_recv_wr* bad_recv_wr = nullptr;
+    recv_wr.next = nullptr;
+    recv_wr.wr_id = 1;
+    recv_wr.num_sge = 1;
+    recv_wr.sg_list = &sge;
+
+    struct ibv_wc wc = {};
+    qp->post_recv(recv_wr, bad_recv_wr);
+    while (!qp->poll_recv_cq(wc)) {
+    }
+    if (wc.status != IBV_WC_SUCCESS) {
+        throw std::runtime_error(
+            std::string("raw recv failed for ") + what + ": " +
+            ibv_wc_status_str(wc.status) +
+            " (status=" + std::to_string(static_cast<int>(wc.status)) + ")");
+    }
+    if (wc.byte_len != expected_bytes) {
+        throw std::runtime_error(
+            std::string("short raw recv for ") + what + ": got " +
+            std::to_string(wc.byte_len) + " expected " +
+            std::to_string(expected_bytes));
+    }
+}
+
 template <typename T>
 void raw_send_pod_wait(std::shared_ptr<rdmapp::qp> qp, const T& value) {
     auto mr = std::make_shared<rdmapp::local_mr>(
@@ -343,6 +368,28 @@ void raw_send_pod_wait(std::shared_ptr<rdmapp::qp> qp, const T& value) {
             const_cast<T*>(&value),
             sizeof(T)));
     raw_send_mr_wait(qp, *mr);
+}
+
+template <typename T>
+T raw_recv_pod_wait(std::shared_ptr<rdmapp::qp> qp, const char* what) {
+    T value{};
+    auto mr = std::make_shared<rdmapp::local_mr>(
+        qp->pd_ptr()->reg_mr(&value, sizeof(T)));
+    raw_recv_mr_wait(qp, *mr, sizeof(T), what);
+    return value;
+}
+
+rdmapp::remote_mr raw_recv_remote_mr_wait(std::shared_ptr<rdmapp::qp> qp,
+                                          const char* what) {
+    char serialized[rdmapp::remote_mr::kSerializedSize];
+    auto mr = std::make_shared<rdmapp::local_mr>(
+        qp->pd_ptr()->reg_mr(serialized, sizeof(serialized)));
+    raw_recv_mr_wait(
+        qp,
+        *mr,
+        static_cast<std::uint32_t>(sizeof(serialized)),
+        what);
+    return rdmapp::remote_mr::deserialize(serialized);
 }
 
 double raw_rdma_wait(std::shared_ptr<rdmapp::qp> qp,
@@ -489,9 +536,12 @@ asio::awaitable<void> handle_client(std::shared_ptr<AcceptedClient> client,
                                     std::shared_ptr<const PromptDbState> db,
                                     std::shared_ptr<const ServerOptions> opts) {
     auto qp = client->qp;
-    ClientHelloWire hello = co_await recv_pod<ClientHelloWire>(qp, "client hello");
-    rdmapp::remote_mr prompt_remote = co_await recv_remote_mr(qp, "prompt");
-    rdmapp::remote_mr result_remote = co_await recv_remote_mr(qp, "result");
+    ClientHelloWire hello =
+        raw_recv_pod_wait<ClientHelloWire>(qp, "client hello");
+    rdmapp::remote_mr prompt_remote =
+        raw_recv_remote_mr_wait(qp, "prompt");
+    rdmapp::remote_mr result_remote =
+        raw_recv_remote_mr_wait(qp, "result");
 
     ServerHelloWire server_hello;
     server_hello.max_tokens = static_cast<std::uint32_t>(opts->max_tokens);
@@ -527,7 +577,7 @@ asio::awaitable<void> handle_client(std::shared_ptr<AcceptedClient> client,
     std::size_t ack_slot_id = 0;
 
     while (true) {
-        RequestWire req = co_await recv_pod<RequestWire>(qp, "request");
+        RequestWire req = raw_recv_pod_wait<RequestWire>(qp, "request");
         if (req.magic != promptdb_rdma::kRequestMagic ||
             req.version != promptdb_rdma::kProtocolVersion) {
             throw std::runtime_error("bad request header");
@@ -665,14 +715,11 @@ int main(int argc, char* argv[]) {
             opts->ib_device, opts->ib_port);
         auto pd = std::make_shared<rdmapp::pd>(device);
         auto io_ctx = std::make_shared<asio::io_context>(opts->io_threads);
-        auto executor = std::make_shared<rdmapp::executor>(io_ctx);
         auto acceptor = std::make_shared<PromptDbAcceptor>(
             io_ctx,
             opts->port,
             pd,
-            device,
-            executor,
-            opts->cq_batch_size);
+            device);
 
         spdlog::info(
             "starting RDMA PromptDB server: port={} ib_device={} ib_port={} io_threads={}",
