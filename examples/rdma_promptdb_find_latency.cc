@@ -374,7 +374,8 @@ void raw_send_mr_wait(std::shared_ptr<rdmapp::qp> qp,
 }
 
 void raw_send_mr_nowait(std::shared_ptr<rdmapp::qp> qp,
-                        const rdmapp::local_mr& local_mr) {
+                        const rdmapp::local_mr& local_mr,
+                        bool signaled = false) {
     struct ibv_sge sge = {};
     sge.addr = reinterpret_cast<std::uint64_t>(local_mr.addr());
     sge.length = static_cast<std::uint32_t>(local_mr.length());
@@ -387,9 +388,22 @@ void raw_send_mr_nowait(std::shared_ptr<rdmapp::qp> qp,
     send_wr.num_sge = 1;
     send_wr.sg_list = &sge;
     send_wr.wr_id = 1;
-    send_wr.send_flags = 0;
+    send_wr.send_flags = signaled ? IBV_SEND_SIGNALED : 0;
 
     qp->post_send(send_wr, bad_send_wr);
+}
+
+void raw_wait_send_completion(std::shared_ptr<rdmapp::qp> qp,
+                              const char* what) {
+    struct ibv_wc wc = {};
+    while (!qp->poll_send_cq(wc)) {
+    }
+    if (wc.status != IBV_WC_SUCCESS) {
+        throw std::runtime_error(
+            std::string("raw send completion failed for ") + what + ": " +
+            ibv_wc_status_str(wc.status) +
+            " (status=" + std::to_string(static_cast<int>(wc.status)) + ")");
+    }
 }
 
 struct RawRecvState {
@@ -690,8 +704,13 @@ public:
         auto ack_state = raw_post_recv_imm(qp_, "ack write-with-imm");
         auto t0 = std::chrono::steady_clock::now();
         std::atomic_thread_fence(std::memory_order_release);
-        raw_send_mr_nowait(qp_, *request_mr_);
+        const bool signal_request =
+            (++request_send_count_ % kSignalRequestEvery) == 0;
+        raw_send_mr_nowait(qp_, *request_mr_, signal_request);
         raw_wait_recv(ack_state);
+        if (signal_request) {
+            raw_wait_send_completion(qp_, "request");
+        }
         std::atomic_thread_fence(std::memory_order_acquire);
         AckWire ack = ack_buffer_;
         auto t1 = std::chrono::steady_clock::now();
@@ -795,6 +814,8 @@ private:
     std::shared_ptr<rdmapp::local_mr> ack_mr_;
     RequestWire request_buffer_{};
     std::shared_ptr<rdmapp::local_mr> request_mr_;
+    static constexpr std::uint32_t kSignalRequestEvery = 32;
+    std::uint32_t request_send_count_ = 0;
     std::vector<std::jthread> io_threads_;
     std::optional<asio::executor_work_guard<asio::io_context::executor_type>>
         work_guard_;
