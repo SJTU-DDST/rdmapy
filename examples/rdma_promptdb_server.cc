@@ -4,6 +4,7 @@
 #include <asio/co_spawn.hpp>
 #include <asio/detached.hpp>
 #include <asio/ip/tcp.hpp>
+#include <asio/post.hpp>
 #include <asio/this_coro.hpp>
 #include <asio/use_awaitable.hpp>
 
@@ -680,6 +681,8 @@ asio::awaitable<void> server_loop(
         asio::co_spawn(
             ex,
             [client, db, opts]() -> asio::awaitable<void> {
+                auto handler_ex = co_await asio::this_coro::executor;
+                co_await asio::post(handler_ex, asio::use_awaitable);
                 try {
                     co_await handle_client(client, db, opts);
                 } catch (const std::exception& e) {
