@@ -488,10 +488,6 @@ struct QuerySample {
     double total_us = 0.0;
     double prompt_transfer_us = 0.0;
     double server_match_us = 0.0;
-    double match_bucket_hash_us = 0.0;
-    double match_candidate_select_us = 0.0;
-    double match_overlap_scan_us = 0.0;
-    double match_result_copy_us = 0.0;
     double result_transfer_us = 0.0;
 };
 
@@ -538,31 +534,6 @@ double sample_server_match_us(const QuerySample& sample) {
 
 double sample_result_transfer_us(const QuerySample& sample) {
     return sample.result_transfer_us;
-}
-
-double sample_match_bucket_hash_us(const QuerySample& sample) {
-    return sample.match_bucket_hash_us;
-}
-
-double sample_match_candidate_select_us(const QuerySample& sample) {
-    return sample.match_candidate_select_us;
-}
-
-double sample_match_overlap_scan_us(const QuerySample& sample) {
-    return sample.match_overlap_scan_us;
-}
-
-double sample_match_result_copy_us(const QuerySample& sample) {
-    return sample.match_result_copy_us;
-}
-
-double sample_match_other_us(const QuerySample& sample) {
-    const double known =
-        sample.match_bucket_hash_us +
-        sample.match_candidate_select_us +
-        sample.match_overlap_scan_us +
-        sample.match_result_copy_us;
-    return sample.server_match_us - known;
 }
 
 double sample_client_overhead_us(const QuerySample& sample) {
@@ -728,10 +699,6 @@ public:
             std::chrono::duration<double, std::micro>(t1 - t0).count();
         sample.prompt_transfer_us = ack.prompt_transfer_us;
         sample.server_match_us = ack.server_match_us;
-        sample.match_bucket_hash_us = ack.match_bucket_hash_us;
-        sample.match_candidate_select_us = ack.match_candidate_select_us;
-        sample.match_overlap_scan_us = ack.match_overlap_scan_us;
-        sample.match_result_copy_us = ack.match_result_copy_us;
         sample.result_transfer_us = ack.result_transfer_us;
         return sample;
     }
@@ -953,22 +920,12 @@ int main(int argc, char* argv[]) {
                 << "threads,total_avg_us,total_p50_us,total_p95_us,total_p99_us,"
                 << "prompt_transfer_avg_us,prompt_transfer_p50_us,"
                 << "server_match_avg_us,server_match_p50_us,"
-                << "match_bucket_hash_avg_us,"
-                << "match_candidate_select_avg_us,"
-                << "match_overlap_scan_avg_us,"
-                << "match_result_copy_avg_us,"
-                << "server_match_other_avg_us,"
                 << "result_transfer_avg_us,result_transfer_p50_us,"
                 << "client_overhead_avg_us\n";
         } else {
             std::cout
                 << "threads,total_avg_us,prompt_transfer_avg_us,"
                 << "server_match_avg_us,"
-                << "match_bucket_hash_avg_us,"
-                << "match_candidate_select_avg_us,"
-                << "match_overlap_scan_avg_us,"
-                << "match_result_copy_avg_us,"
-                << "server_match_other_avg_us,"
                 << "result_transfer_avg_us,"
                 << "client_overhead_avg_us\n";
         }
@@ -999,11 +956,6 @@ int main(int argc, char* argv[]) {
                           << percentile_field(samples, sample_prompt_transfer_us, 50) << ","
                           << mean_field(samples, sample_server_match_us) << ","
                           << percentile_field(samples, sample_server_match_us, 50) << ","
-                          << mean_field(samples, sample_match_bucket_hash_us) << ","
-                          << mean_field(samples, sample_match_candidate_select_us) << ","
-                          << mean_field(samples, sample_match_overlap_scan_us) << ","
-                          << mean_field(samples, sample_match_result_copy_us) << ","
-                          << mean_field(samples, sample_match_other_us) << ","
                           << mean_field(samples, sample_result_transfer_us) << ","
                           << percentile_field(samples, sample_result_transfer_us, 50) << ","
                           << mean_field(samples, sample_client_overhead_us)
@@ -1013,11 +965,6 @@ int main(int argc, char* argv[]) {
                           << mean_field(samples, sample_total_us) << ","
                           << mean_field(samples, sample_prompt_transfer_us) << ","
                           << mean_field(samples, sample_server_match_us) << ","
-                          << mean_field(samples, sample_match_bucket_hash_us) << ","
-                          << mean_field(samples, sample_match_candidate_select_us) << ","
-                          << mean_field(samples, sample_match_overlap_scan_us) << ","
-                          << mean_field(samples, sample_match_result_copy_us) << ","
-                          << mean_field(samples, sample_match_other_us) << ","
                           << mean_field(samples, sample_result_transfer_us) << ","
                           << mean_field(samples, sample_client_overhead_us)
                           << "\n";

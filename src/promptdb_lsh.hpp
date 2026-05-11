@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <array>
 #include <charconv>
-#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <deque>
@@ -20,7 +19,7 @@
 
 namespace promptdb_rdma {
 
-constexpr std::uint16_t kProtocolVersion = 1;
+constexpr std::uint16_t kProtocolVersion = 3;
 constexpr std::uint32_t kClientHelloMagic = 0x48444250u; // PDBH
 constexpr std::uint32_t kServerHelloMagic = 0x68534450u; // PDSh
 constexpr std::uint32_t kRequestMagic = 0x51424450u;     // PDBQ
@@ -74,10 +73,6 @@ struct AckWire {
     std::int32_t best_idx = -1;
     double prompt_transfer_us = 0.0;
     double server_match_us = 0.0;
-    double match_bucket_hash_us = 0.0;
-    double match_candidate_select_us = 0.0;
-    double match_overlap_scan_us = 0.0;
-    double match_result_copy_us = 0.0;
     double result_transfer_us = 0.0;
 };
 
@@ -225,18 +220,6 @@ struct FindResult {
     std::vector<std::uint32_t> best_tokens;
 };
 
-struct MatchTiming {
-    double bucket_hash_us = 0.0;
-    double candidate_select_us = 0.0;
-    double overlap_scan_us = 0.0;
-    double result_copy_us = 0.0;
-};
-
-inline double elapsed_us(std::chrono::steady_clock::time_point start,
-                         std::chrono::steady_clock::time_point end) {
-    return std::chrono::duration<double, std::micro>(end - start).count();
-}
-
 inline bool contains_token(std::span<const std::uint32_t> values,
                            std::uint32_t needle) {
     return std::find(values.begin(), values.end(), needle) != values.end();
@@ -367,22 +350,8 @@ public:
 
     FindResult find_most_similar_prompt(
         std::span<const std::uint32_t> input_tokens) const {
-        return find_most_similar_prompt(input_tokens, nullptr);
-    }
-
-    FindResult find_most_similar_prompt(
-        std::span<const std::uint32_t> input_tokens,
-        MatchTiming* timing) const {
-        const auto bucket_hash_start = std::chrono::steady_clock::now();
         const int bucket_id = get_bucket_id(input_tokens);
-        const auto bucket_hash_end = std::chrono::steady_clock::now();
-        if (timing != nullptr) {
-            timing->bucket_hash_us =
-                elapsed_us(bucket_hash_start, bucket_hash_end);
-        }
 
-        const auto candidate_select_start =
-            std::chrono::steady_clock::now();
         const std::deque<int>* bucket_candidates = nullptr;
         if (bucket_id != -1) {
             const auto& bucket =
@@ -391,14 +360,8 @@ public:
                 bucket_candidates = &bucket;
             }
         }
-        const auto candidate_select_end = std::chrono::steady_clock::now();
-        if (timing != nullptr) {
-            timing->candidate_select_us =
-                elapsed_us(candidate_select_start, candidate_select_end);
-        }
 
         FindResult result;
-        double result_copy_us = 0.0;
         auto visit_candidate = [&](int idx) {
             if (idx < 0 || idx >= config_.prompts_len ||
                 !alive_[static_cast<std::size_t>(idx)]) {
@@ -414,14 +377,10 @@ public:
             if (score > result.best_score) {
                 result.best_score = score;
                 result.best_idx = idx;
-                const auto copy_start = std::chrono::steady_clock::now();
                 result.best_tokens = tokens;
-                const auto copy_end = std::chrono::steady_clock::now();
-                result_copy_us += elapsed_us(copy_start, copy_end);
             }
         };
 
-        const auto overlap_scan_start = std::chrono::steady_clock::now();
         if (bucket_candidates != nullptr) {
             for (int idx : *bucket_candidates) {
                 visit_candidate(idx);
@@ -431,16 +390,6 @@ public:
                 if (alive_[static_cast<std::size_t>(idx)]) {
                     visit_candidate(idx);
                 }
-            }
-        }
-        const auto overlap_scan_end = std::chrono::steady_clock::now();
-        if (timing != nullptr) {
-            timing->result_copy_us = result_copy_us;
-            timing->overlap_scan_us =
-                elapsed_us(overlap_scan_start, overlap_scan_end) -
-                result_copy_us;
-            if (timing->overlap_scan_us < 0.0) {
-                timing->overlap_scan_us = 0.0;
             }
         }
 

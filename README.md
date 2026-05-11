@@ -336,11 +336,6 @@ server 和 client 的 `--prompts/--token-len/--vocab-size/--seed` 要保持一�
 - `prompt_transfer_avg_us`：server 用 RDMA READ 从计算节点 prompt MR 拉取
   当前 prompt 的时间。
 - `server_match_avg_us`：server 执行 C++ LSH/Jaccard 匹配的时间。
-- `match_bucket_hash_avg_us`：server 计算 LSH signature 和 CRC32 bucket id 的时间。
-- `match_candidate_select_avg_us`：server 查找 bucket 并判断是否需要兜底扫描的时间。
-- `match_overlap_scan_avg_us`：server 对候选 prompt 执行 Jaccard overlap 的时间。
-- `match_result_copy_avg_us`：server 把当前 best prompt tokens 拷贝到返回结果里的时间。
-- `server_match_other_avg_us`：`server_match_avg_us` 减去上述四个子阶段后的残差。
 - `result_transfer_avg_us`：server 用 RDMA WRITE 把 best prompt/result 写回
   计算节点 result MR 的时间。
 - `client_overhead_avg_us`：request SEND、ACK SEND/RECV 通知、CQ polling
