@@ -1,9 +1,11 @@
-#include "qp_acceptor.h"
+#include "qp_transmission.h"
 #include "promptdb_lsh.hpp"
 
 #include <asio/co_spawn.hpp>
 #include <asio/detached.hpp>
+#include <asio/ip/tcp.hpp>
 #include <asio/this_coro.hpp>
+#include <asio/use_awaitable.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -59,6 +61,65 @@ struct ServerOptions {
 };
 
 std::atomic<int> g_live_connections = 0;
+
+struct AcceptedClient {
+    std::shared_ptr<rdmapp::qp> qp;
+    std::shared_ptr<rdmapp::cq> recv_cq;
+    std::shared_ptr<rdmapp::cq> send_cq;
+    std::shared_ptr<rdmapp::cq_poller> recv_poller;
+};
+
+class PromptDbAcceptor {
+public:
+    PromptDbAcceptor(std::shared_ptr<asio::io_context> io_ctx,
+                     std::uint16_t port,
+                     std::shared_ptr<rdmapp::pd> pd,
+                     std::shared_ptr<rdmapp::device> device,
+                     std::shared_ptr<rdmapp::executor> executor,
+                     std::size_t cq_batch_size)
+        : io_ctx_(std::move(io_ctx)),
+          pd_(std::move(pd)),
+          device_(std::move(device)),
+          executor_(std::move(executor)),
+          cq_batch_size_(cq_batch_size),
+          acceptor_(*io_ctx_, {asio::ip::tcp::v4(), port}) {}
+
+    asio::awaitable<std::shared_ptr<AcceptedClient>> accept() {
+        try {
+            asio::ip::tcp::socket socket =
+                co_await acceptor_.async_accept(asio::use_awaitable);
+            auto remote_qp = co_await rdmapp::recv_qp(socket);
+
+            auto client = std::make_shared<AcceptedClient>();
+            client->recv_cq = std::make_shared<rdmapp::cq>(device_);
+            client->send_cq = std::make_shared<rdmapp::cq>(device_);
+            client->recv_poller = std::make_shared<rdmapp::cq_poller>(
+                client->recv_cq, executor_, cq_batch_size_);
+            client->qp = std::make_shared<rdmapp::qp>(
+                remote_qp.header.lid,
+                remote_qp.header.qp_num,
+                remote_qp.header.sq_psn,
+                remote_qp.header.gid,
+                pd_,
+                client->recv_cq,
+                client->send_cq);
+            client->qp->user_data() = std::move(remote_qp.user_data);
+            co_await rdmapp::send_qp(*client->qp, socket);
+            co_return client;
+        } catch (const std::exception& e) {
+            spdlog::error("accept promptdb qp failed: {}", e.what());
+            co_return nullptr;
+        }
+    }
+
+private:
+    std::shared_ptr<asio::io_context> io_ctx_;
+    std::shared_ptr<rdmapp::pd> pd_;
+    std::shared_ptr<rdmapp::device> device_;
+    std::shared_ptr<rdmapp::executor> executor_;
+    std::size_t cq_batch_size_;
+    asio::ip::tcp::acceptor acceptor_;
+};
 
 [[noreturn]] void usage_error(const std::string& message) {
     throw std::runtime_error("argument error: " + message);
@@ -242,6 +303,86 @@ asio::awaitable<void> send_pod(std::shared_ptr<rdmapp::qp> qp,
     co_await qp->send(span);
 }
 
+double elapsed_us(std::chrono::steady_clock::time_point start,
+                  std::chrono::steady_clock::time_point end) {
+    return std::chrono::duration<double, std::micro>(end - start).count();
+}
+
+void raw_send_mr_wait(std::shared_ptr<rdmapp::qp> qp,
+                      const rdmapp::local_mr& local_mr) {
+    struct ibv_sge sge = {};
+    sge.addr = reinterpret_cast<std::uint64_t>(local_mr.addr());
+    sge.length = static_cast<std::uint32_t>(local_mr.length());
+    sge.lkey = local_mr.lkey();
+
+    struct ibv_send_wr send_wr = {};
+    struct ibv_send_wr* bad_send_wr = nullptr;
+    send_wr.opcode = IBV_WR_SEND;
+    send_wr.next = nullptr;
+    send_wr.num_sge = 1;
+    send_wr.sg_list = &sge;
+    send_wr.wr_id = 1;
+    send_wr.send_flags = IBV_SEND_SIGNALED;
+
+    qp->post_send(send_wr, bad_send_wr);
+    struct ibv_wc wc = {};
+    while (!qp->poll_send_cq(wc)) {
+    }
+    if (wc.status != IBV_WC_SUCCESS) {
+        throw std::runtime_error(
+            std::string("raw send failed: ") +
+            ibv_wc_status_str(wc.status) +
+            " (status=" + std::to_string(static_cast<int>(wc.status)) + ")");
+    }
+}
+
+template <typename T>
+void raw_send_pod_wait(std::shared_ptr<rdmapp::qp> qp, const T& value) {
+    auto mr = std::make_shared<rdmapp::local_mr>(
+        qp->pd_ptr()->reg_mr(
+            const_cast<T*>(&value),
+            sizeof(T)));
+    raw_send_mr_wait(qp, *mr);
+}
+
+double raw_rdma_wait(std::shared_ptr<rdmapp::qp> qp,
+                     enum ibv_wr_opcode opcode,
+                     rdmapp::remote_mr remote_mr,
+                     const rdmapp::local_mr& local_mr,
+                     void* local_addr,
+                     std::uint32_t length) {
+    struct ibv_sge sge = {};
+    sge.addr = reinterpret_cast<std::uint64_t>(local_addr);
+    sge.length = length;
+    sge.lkey = local_mr.lkey();
+
+    struct ibv_send_wr send_wr = {};
+    struct ibv_send_wr* bad_send_wr = nullptr;
+    send_wr.opcode = opcode;
+    send_wr.next = nullptr;
+    send_wr.num_sge = 1;
+    send_wr.sg_list = &sge;
+    send_wr.wr_id = 1;
+    send_wr.send_flags = IBV_SEND_SIGNALED;
+    send_wr.wr.rdma.remote_addr =
+        reinterpret_cast<std::uint64_t>(remote_mr.addr());
+    send_wr.wr.rdma.rkey = remote_mr.rkey();
+
+    struct ibv_wc wc = {};
+    const auto t0 = std::chrono::steady_clock::now();
+    qp->post_send(send_wr, bad_send_wr);
+    while (!qp->poll_send_cq(wc)) {
+    }
+    const auto t1 = std::chrono::steady_clock::now();
+    if (wc.status != IBV_WC_SUCCESS) {
+        throw std::runtime_error(
+            std::string("raw RDMA failed: ") +
+            ibv_wc_status_str(wc.status) +
+            " (status=" + std::to_string(static_cast<int>(wc.status)) + ")");
+    }
+    return elapsed_us(t0, t1);
+}
+
 asio::awaitable<rdmapp::remote_mr>
 recv_remote_mr(std::shared_ptr<rdmapp::qp> qp, const char* what) {
     char serialized[rdmapp::remote_mr::kSerializedSize];
@@ -325,11 +466,6 @@ void fill_result_buffer(std::vector<std::uint8_t>& result_buffer,
     }
 }
 
-double elapsed_us(std::chrono::steady_clock::time_point start,
-                  std::chrono::steady_clock::time_point end) {
-    return std::chrono::duration<double, std::micro>(end - start).count();
-}
-
 void post_ack_without_wait(std::shared_ptr<rdmapp::qp> qp,
                            const rdmapp::local_mr& ack_mr) {
     struct ibv_sge sge = {};
@@ -349,9 +485,10 @@ void post_ack_without_wait(std::shared_ptr<rdmapp::qp> qp,
     qp->post_send(send_wr, bad_send_wr);
 }
 
-asio::awaitable<void> handle_client(std::shared_ptr<rdmapp::qp> qp,
+asio::awaitable<void> handle_client(std::shared_ptr<AcceptedClient> client,
                                     std::shared_ptr<const PromptDbState> db,
                                     std::shared_ptr<const ServerOptions> opts) {
+    auto qp = client->qp;
     ClientHelloWire hello = co_await recv_pod<ClientHelloWire>(qp, "client hello");
     rdmapp::remote_mr prompt_remote = co_await recv_remote_mr(qp, "prompt");
     rdmapp::remote_mr result_remote = co_await recv_remote_mr(qp, "result");
@@ -366,7 +503,7 @@ asio::awaitable<void> handle_client(std::shared_ptr<rdmapp::qp> qp,
         server_hello.status = static_cast<std::uint16_t>(Status::bad_request);
         hello_error = std::current_exception();
     }
-    co_await send_pod(qp, server_hello);
+    raw_send_pod_wait(qp, server_hello);
     if (hello_error) {
         std::rethrow_exception(hello_error);
     }
@@ -421,15 +558,13 @@ asio::awaitable<void> handle_client(std::shared_ptr<rdmapp::qp> qp,
                 promptdb_rdma::prompt_bytes_for_tokens(req.token_count);
             auto prompt_sub =
                 sub_remote_mr(prompt_remote, 0, prompt_bytes, "prompt");
-            const auto prompt_read_start = std::chrono::steady_clock::now();
-            co_await qp->read(
+            ack.prompt_transfer_us = raw_rdma_wait(
+                qp,
+                IBV_WR_RDMA_READ,
                 prompt_sub,
-                prompt_mr,
+                *prompt_mr,
                 prompt_buffer.data(),
                 prompt_bytes);
-            const auto prompt_read_end = std::chrono::steady_clock::now();
-            ack.prompt_transfer_us =
-                elapsed_us(prompt_read_start, prompt_read_end);
 
             std::vector<std::uint32_t> tokens(
                 prompt_buffer.begin(),
@@ -445,15 +580,13 @@ asio::awaitable<void> handle_client(std::shared_ptr<rdmapp::qp> qp,
                 reinterpret_cast<const ResultHeaderWire*>(result_buffer.data());
             auto result_sub =
                 sub_remote_mr(result_remote, 0, header->result_bytes, "result");
-            const auto result_write_start = std::chrono::steady_clock::now();
-            co_await qp->write(
+            ack.result_transfer_us = raw_rdma_wait(
+                qp,
+                IBV_WR_RDMA_WRITE,
                 result_sub,
-                result_mr,
+                *result_mr,
                 result_buffer.data(),
                 header->result_bytes);
-            const auto result_write_end = std::chrono::steady_clock::now();
-            ack.result_transfer_us =
-                elapsed_us(result_write_start, result_write_end);
 
             ack.status = header->status;
             ack.result_bytes = header->result_bytes;
@@ -472,13 +605,13 @@ asio::awaitable<void> handle_client(std::shared_ptr<rdmapp::qp> qp,
 }
 
 asio::awaitable<void> server_loop(
-    std::shared_ptr<rdmapp::qp_acceptor> acceptor,
+    std::shared_ptr<PromptDbAcceptor> acceptor,
     std::shared_ptr<const PromptDbState> db,
     std::shared_ptr<const ServerOptions> opts) {
     auto ex = co_await asio::this_coro::executor;
     while (true) {
-        auto qp = co_await acceptor->accept();
-        if (!qp) {
+        auto client = co_await acceptor->accept();
+        if (!client || !client->qp) {
             continue;
         }
         if (g_live_connections.load() >= opts->max_connections) {
@@ -489,9 +622,9 @@ asio::awaitable<void> server_loop(
         g_live_connections.fetch_add(1);
         asio::co_spawn(
             ex,
-            [qp, db, opts]() -> asio::awaitable<void> {
+            [client, db, opts]() -> asio::awaitable<void> {
                 try {
-                    co_await handle_client(qp, db, opts);
+                    co_await handle_client(client, db, opts);
                 } catch (const std::exception& e) {
                     spdlog::info("client handler ended: {}", e.what());
                 }
@@ -531,14 +664,15 @@ int main(int argc, char* argv[]) {
         auto device = std::make_shared<rdmapp::device>(
             opts->ib_device, opts->ib_port);
         auto pd = std::make_shared<rdmapp::pd>(device);
-        auto cq = std::make_shared<rdmapp::cq>(device);
         auto io_ctx = std::make_shared<asio::io_context>(opts->io_threads);
         auto executor = std::make_shared<rdmapp::executor>(io_ctx);
-        auto cq_poller =
-            std::make_shared<rdmapp::cq_poller>(
-                cq, executor, opts->cq_batch_size);
-        auto acceptor = std::make_shared<rdmapp::qp_acceptor>(
-            io_ctx, opts->port, pd, cq);
+        auto acceptor = std::make_shared<PromptDbAcceptor>(
+            io_ctx,
+            opts->port,
+            pd,
+            device,
+            executor,
+            opts->cq_batch_size);
 
         spdlog::info(
             "starting RDMA PromptDB server: port={} ib_device={} ib_port={} io_threads={}",
