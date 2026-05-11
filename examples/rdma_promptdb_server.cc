@@ -34,6 +34,7 @@ namespace {
 using promptdb_rdma::AckWire;
 using promptdb_rdma::ClientHelloWire;
 using promptdb_rdma::FindResult;
+using promptdb_rdma::MatchTiming;
 using promptdb_rdma::PromptDbConfig;
 using promptdb_rdma::PromptDbState;
 using promptdb_rdma::RequestOp;
@@ -624,10 +625,17 @@ void handle_client(std::shared_ptr<AcceptedClient> client,
 
             std::span<const std::uint32_t> tokens(
                 prompt_buffer.data(), req.token_count);
+            MatchTiming match_timing;
             const auto match_start = std::chrono::steady_clock::now();
-            FindResult result = db->find_most_similar_prompt(tokens);
+            FindResult result =
+                db->find_most_similar_prompt(tokens, &match_timing);
             const auto match_end = std::chrono::steady_clock::now();
             ack.server_match_us = elapsed_us(match_start, match_end);
+            ack.match_bucket_hash_us = match_timing.bucket_hash_us;
+            ack.match_candidate_select_us =
+                match_timing.candidate_select_us;
+            ack.match_overlap_scan_us = match_timing.overlap_scan_us;
+            ack.match_result_copy_us = match_timing.result_copy_us;
             fill_result_buffer(result_buffer, req.request_id, result);
 
             const auto* header =
