@@ -348,9 +348,10 @@ server 和 client 的 `--prompts/--token-len/--vocab-size/--seed` 要保持一�
 worker 同时发起请求”的 burst 压测时再加 `--sync-each-repeat` 或
 `--round-sync`。如果要降低 CPU 调度抖动，可以像 C++ READ benchmark 一样
 加 `--cpu-list 0-15`，把第 N 个 worker 绑到列表里的第 N 个 CPU。
-PromptDB server 的数据面和控制面都使用 raw-poll；server handler 会占用
-`io_context` 线程等待请求，所以 `--io-threads` 应大于最大并发连接数，
-例如 16 个 client worker 时建议 server 设为 `--io-threads 32`。
+PromptDB server 的数据面和控制面都使用 raw-poll；server 用 `io_context`
+只负责接收新连接，每个 client 连接会交给一个独立 handler 线程处理，所以
+`--io-threads` 设为 2 到 4 通常就够了。16 个 client worker 时建议
+`--max-connections 128`，避免反复测试时连接数上限太紧。
 
 ## 常见问题
 

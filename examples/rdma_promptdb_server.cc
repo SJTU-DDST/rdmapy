@@ -4,8 +4,6 @@
 #include <asio/co_spawn.hpp>
 #include <asio/detached.hpp>
 #include <asio/ip/tcp.hpp>
-#include <asio/post.hpp>
-#include <asio/this_coro.hpp>
 #include <asio/use_awaitable.hpp>
 
 #include <algorithm>
@@ -535,9 +533,9 @@ void post_ack_without_wait(std::shared_ptr<rdmapp::qp> qp,
     qp->post_send(send_wr, bad_send_wr);
 }
 
-asio::awaitable<void> handle_client(std::shared_ptr<AcceptedClient> client,
-                                    std::shared_ptr<const PromptDbState> db,
-                                    std::shared_ptr<const ServerOptions> opts) {
+void handle_client(std::shared_ptr<AcceptedClient> client,
+                   std::shared_ptr<const PromptDbState> db,
+                   std::shared_ptr<const ServerOptions> opts) {
     auto qp = client->qp;
     ClientHelloWire hello =
         raw_recv_pod_wait<ClientHelloWire>(qp, "client hello");
@@ -591,7 +589,7 @@ asio::awaitable<void> handle_client(std::shared_ptr<AcceptedClient> client,
             throw std::runtime_error("bad request header");
         }
         if (req.op == static_cast<std::uint16_t>(RequestOp::shutdown)) {
-            co_return;
+            return;
         }
         if (req.op != static_cast<std::uint16_t>(RequestOp::query)) {
             const std::size_t slot = ack_slot_id++ % kAckRingSize;
@@ -666,7 +664,6 @@ asio::awaitable<void> server_loop(
     std::shared_ptr<PromptDbAcceptor> acceptor,
     std::shared_ptr<const PromptDbState> db,
     std::shared_ptr<const ServerOptions> opts) {
-    auto ex = co_await asio::this_coro::executor;
     while (true) {
         auto client = co_await acceptor->accept();
         if (!client || !client->qp) {
@@ -678,20 +675,14 @@ asio::awaitable<void> server_loop(
         }
 
         g_live_connections.fetch_add(1);
-        asio::co_spawn(
-            ex,
-            [client, db, opts]() -> asio::awaitable<void> {
-                auto handler_ex = co_await asio::this_coro::executor;
-                co_await asio::post(handler_ex, asio::use_awaitable);
-                try {
-                    co_await handle_client(client, db, opts);
-                } catch (const std::exception& e) {
-                    spdlog::info("client handler ended: {}", e.what());
-                }
-                g_live_connections.fetch_sub(1);
-                co_return;
-            }(),
-            asio::detached);
+        std::thread([client, db, opts] {
+            try {
+                handle_client(client, db, opts);
+            } catch (const std::exception& e) {
+                spdlog::info("client handler ended: {}", e.what());
+            }
+            g_live_connections.fetch_sub(1);
+        }).detach();
     }
 }
 
