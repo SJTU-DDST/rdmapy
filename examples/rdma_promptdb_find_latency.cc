@@ -62,9 +62,9 @@ struct Options {
     int seed = 42;
     int min_threads = 1;
     int max_threads = 16;
-    int repeats = 100;
-    int warmup = 10;
-    int trials = 1;
+    int repeats = 1000;
+    int warmup = 100;
+    int trials = 3;
     std::int64_t pace_us = 0;
     std::int64_t stagger_us = 0;
     int thread_gap_ms = 50;
@@ -130,9 +130,9 @@ void print_usage(const char* prog) {
         << "Benchmark:\n"
         << "  --min-threads N             default: 1\n"
         << "  --max-threads N             default: 16\n"
-        << "  --repeats N                 default: 100\n"
-        << "  --warmup N                  default: 10\n"
-        << "  --trials N                  default: 1\n"
+        << "  --repeats N                 default: 1000\n"
+        << "  --warmup N                  default: 100\n"
+        << "  --trials N                  default: 3; each trial recreates QP/CQ\n"
         << "  --pace-us N                 default: 0\n"
         << "  --stagger-us N              default: 0\n"
         << "  --thread-gap-ms N           default: 50; pause after each thread count\n"
@@ -364,6 +364,62 @@ double percentile(std::vector<double> values, double pct) {
     return values[idx];
 }
 
+struct QuerySample {
+    double total_us = 0.0;
+    double prompt_transfer_us = 0.0;
+    double server_match_us = 0.0;
+    double result_transfer_us = 0.0;
+};
+
+double client_overhead_us(const QuerySample& sample) {
+    return sample.total_us -
+           sample.prompt_transfer_us -
+           sample.server_match_us -
+           sample.result_transfer_us;
+}
+
+std::vector<double> collect_field(
+    const std::vector<QuerySample>& samples,
+    double (*field_fn)(const QuerySample&)) {
+    std::vector<double> values;
+    values.reserve(samples.size());
+    for (const auto& sample : samples) {
+        values.push_back(field_fn(sample));
+    }
+    return values;
+}
+
+double mean_field(const std::vector<QuerySample>& samples,
+                  double (*field_fn)(const QuerySample&)) {
+    return mean(collect_field(samples, field_fn));
+}
+
+double percentile_field(const std::vector<QuerySample>& samples,
+                        double (*field_fn)(const QuerySample&),
+                        double pct) {
+    return percentile(collect_field(samples, field_fn), pct);
+}
+
+double sample_total_us(const QuerySample& sample) {
+    return sample.total_us;
+}
+
+double sample_prompt_transfer_us(const QuerySample& sample) {
+    return sample.prompt_transfer_us;
+}
+
+double sample_server_match_us(const QuerySample& sample) {
+    return sample.server_match_us;
+}
+
+double sample_result_transfer_us(const QuerySample& sample) {
+    return sample.result_transfer_us;
+}
+
+double sample_client_overhead_us(const QuerySample& sample) {
+    return client_overhead_us(sample);
+}
+
 void pin_current_thread_to_cpu(int cpu) {
 #ifdef __linux__
     cpu_set_t set;
@@ -486,8 +542,8 @@ public:
         }
     }
 
-    double query_us(const std::vector<std::uint32_t>& tokens,
-                    std::uint64_t request_id) {
+    QuerySample query(const std::vector<std::uint32_t>& tokens,
+                      std::uint64_t request_id) {
         if (tokens.empty() ||
             tokens.size() > static_cast<std::size_t>(opts_.max_tokens)) {
             throw std::runtime_error("query token count out of range");
@@ -511,7 +567,13 @@ public:
         auto t1 = std::chrono::steady_clock::now();
 
         validate_ack_and_result(ack, req.request_id);
-        return std::chrono::duration<double, std::micro>(t1 - t0).count();
+        QuerySample sample;
+        sample.total_us =
+            std::chrono::duration<double, std::micro>(t1 - t0).count();
+        sample.prompt_transfer_us = ack.prompt_transfer_us;
+        sample.server_match_us = ack.server_match_us;
+        sample.result_transfer_us = ack.result_transfer_us;
+        return sample;
     }
 
 private:
@@ -675,7 +737,7 @@ private:
     bool closed_ = false;
 };
 
-std::vector<double> run_trial(
+std::vector<QuerySample> run_trial(
     const Options& opts,
     const std::vector<std::vector<std::uint32_t>>& prompts,
     int threads,
@@ -686,7 +748,7 @@ std::vector<double> run_trial(
         connections.push_back(std::make_unique<PromptDbConnection>(opts));
     }
 
-    std::vector<std::vector<double>> per_worker(
+    std::vector<std::vector<QuerySample>> per_worker(
         static_cast<std::size_t>(threads));
     StartGate start_gate(threads);
     ReusableGate round_gate(threads);
@@ -740,11 +802,11 @@ std::vector<double> run_trial(
                         static_cast<std::uint64_t>(worker_id) *
                             1'000'000ull +
                         static_cast<std::uint64_t>(iteration);
-                    const double latency_us =
+                    const QuerySample sample =
                         connections[static_cast<std::size_t>(worker_id)]
-                            ->query_us(prompts[prompt_id], request_id);
+                            ->query(prompts[prompt_id], request_id);
                     if (iteration >= opts.warmup) {
-                        latencies.push_back(latency_us);
+                        latencies.push_back(sample);
                     }
                 }
             } catch (...) {
@@ -763,7 +825,7 @@ std::vector<double> run_trial(
         std::rethrow_exception(first_exception);
     }
 
-    std::vector<double> flat;
+    std::vector<QuerySample> flat;
     flat.reserve(static_cast<std::size_t>(threads * opts.repeats));
     for (auto& latencies : per_worker) {
         flat.insert(flat.end(), latencies.begin(), latencies.end());
@@ -793,15 +855,23 @@ int main(int argc, char* argv[]) {
             << " sync_each_repeat=" << (opts.sync_each_repeat ? "true" : "false")
             << " data_path=server_rdma_read_prompt_then_rdma_write_result\n";
         if (opts.verbose) {
-            std::cout << "threads,avg_us,p50_us,p95_us,p99_us\n";
+            std::cout
+                << "threads,total_avg_us,total_p50_us,total_p95_us,total_p99_us,"
+                << "prompt_transfer_avg_us,prompt_transfer_p50_us,"
+                << "server_match_avg_us,server_match_p50_us,"
+                << "result_transfer_avg_us,result_transfer_p50_us,"
+                << "client_overhead_avg_us\n";
         } else {
-            std::cout << "threads,avg_us\n";
+            std::cout
+                << "threads,total_avg_us,prompt_transfer_avg_us,"
+                << "server_match_avg_us,result_transfer_avg_us,"
+                << "client_overhead_avg_us\n";
         }
 
         for (int threads = opts.min_threads;
              threads <= opts.max_threads;
              ++threads) {
-            std::vector<double> latencies;
+            std::vector<QuerySample> samples;
             for (int trial = 0; trial < opts.trials; ++trial) {
                 auto trial_latencies = run_trial(
                     opts,
@@ -809,19 +879,33 @@ int main(int argc, char* argv[]) {
                     threads,
                     static_cast<std::uint64_t>(threads) * 100'000'000ull +
                         static_cast<std::uint64_t>(trial) * 10'000'000ull);
-                latencies.insert(latencies.end(),
-                                 trial_latencies.begin(),
-                                 trial_latencies.end());
+                samples.insert(samples.end(),
+                               trial_latencies.begin(),
+                               trial_latencies.end());
             }
 
             if (opts.verbose) {
                 std::cout << threads << ","
-                          << mean(latencies) << ","
-                          << percentile(latencies, 50) << ","
-                          << percentile(latencies, 95) << ","
-                          << percentile(latencies, 99) << "\n";
+                          << mean_field(samples, sample_total_us) << ","
+                          << percentile_field(samples, sample_total_us, 50) << ","
+                          << percentile_field(samples, sample_total_us, 95) << ","
+                          << percentile_field(samples, sample_total_us, 99) << ","
+                          << mean_field(samples, sample_prompt_transfer_us) << ","
+                          << percentile_field(samples, sample_prompt_transfer_us, 50) << ","
+                          << mean_field(samples, sample_server_match_us) << ","
+                          << percentile_field(samples, sample_server_match_us, 50) << ","
+                          << mean_field(samples, sample_result_transfer_us) << ","
+                          << percentile_field(samples, sample_result_transfer_us, 50) << ","
+                          << mean_field(samples, sample_client_overhead_us)
+                          << "\n";
             } else {
-                std::cout << threads << "," << mean(latencies) << "\n";
+                std::cout << threads << ","
+                          << mean_field(samples, sample_total_us) << ","
+                          << mean_field(samples, sample_prompt_transfer_us) << ","
+                          << mean_field(samples, sample_server_match_us) << ","
+                          << mean_field(samples, sample_result_transfer_us) << ","
+                          << mean_field(samples, sample_client_overhead_us)
+                          << "\n";
             }
             std::cout.flush();
             if (opts.thread_gap_ms > 0 && threads != opts.max_threads) {

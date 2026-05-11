@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -324,6 +325,11 @@ void fill_result_buffer(std::vector<std::uint8_t>& result_buffer,
     }
 }
 
+double elapsed_us(std::chrono::steady_clock::time_point start,
+                  std::chrono::steady_clock::time_point end) {
+    return std::chrono::duration<double, std::micro>(end - start).count();
+}
+
 void post_ack_without_wait(std::shared_ptr<rdmapp::qp> qp,
                            const rdmapp::local_mr& ack_mr) {
     struct ibv_sge sge = {};
@@ -338,7 +344,7 @@ void post_ack_without_wait(std::shared_ptr<rdmapp::qp> qp,
     send_wr.num_sge = 1;
     send_wr.sg_list = &sge;
     send_wr.wr_id = 0;
-    send_wr.send_flags = IBV_SEND_SIGNALED;
+    send_wr.send_flags = 0;
 
     qp->post_send(send_wr, bad_send_wr);
 }
@@ -415,28 +421,39 @@ asio::awaitable<void> handle_client(std::shared_ptr<rdmapp::qp> qp,
                 promptdb_rdma::prompt_bytes_for_tokens(req.token_count);
             auto prompt_sub =
                 sub_remote_mr(prompt_remote, 0, prompt_bytes, "prompt");
+            const auto prompt_read_start = std::chrono::steady_clock::now();
             co_await qp->read(
                 prompt_sub,
                 prompt_mr,
                 prompt_buffer.data(),
                 prompt_bytes);
+            const auto prompt_read_end = std::chrono::steady_clock::now();
+            ack.prompt_transfer_us =
+                elapsed_us(prompt_read_start, prompt_read_end);
 
             std::vector<std::uint32_t> tokens(
                 prompt_buffer.begin(),
                 prompt_buffer.begin() +
                     static_cast<std::ptrdiff_t>(req.token_count));
+            const auto match_start = std::chrono::steady_clock::now();
             FindResult result = db->find_most_similar_prompt(tokens);
+            const auto match_end = std::chrono::steady_clock::now();
+            ack.server_match_us = elapsed_us(match_start, match_end);
             fill_result_buffer(result_buffer, req.request_id, result);
 
             const auto* header =
                 reinterpret_cast<const ResultHeaderWire*>(result_buffer.data());
             auto result_sub =
                 sub_remote_mr(result_remote, 0, header->result_bytes, "result");
+            const auto result_write_start = std::chrono::steady_clock::now();
             co_await qp->write(
                 result_sub,
                 result_mr,
                 result_buffer.data(),
                 header->result_bytes);
+            const auto result_write_end = std::chrono::steady_clock::now();
+            ack.result_transfer_us =
+                elapsed_us(result_write_start, result_write_end);
 
             ack.status = header->status;
             ack.result_bytes = header->result_bytes;

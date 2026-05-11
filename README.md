@@ -323,15 +323,24 @@ cmake --build build -j --target rdma_promptdb_server rdma_promptdb_find_latency
   --seed 42 \
   --min-threads 1 \
   --max-threads 16 \
-  --repeats 100 \
-  --warmup 10 \
-  --trials 1 \
+  --repeats 1000 \
+  --warmup 100 \
+  --trials 3 \
   --no-round-sync
 ```
 
 server 和 client 的 `--prompts/--token-len/--vocab-size/--seed` 要保持一致，
-这样 benchmark 查询的是 server 预填充的同一批 prompt。输出默认是
-`threads,avg_us`，加 `--verbose` 会额外输出 p50/p95/p99。
+这样 benchmark 查询的是 server 预填充的同一批 prompt。输出默认会拆成：
+
+- `total_avg_us`：client 观察到的端到端 query 时间。
+- `prompt_transfer_avg_us`：server 用 RDMA READ 从计算节点 prompt MR 拉取
+  当前 prompt 的时间。
+- `server_match_avg_us`：server 执行 C++ LSH/Jaccard 匹配的时间。
+- `result_transfer_avg_us`：server 用 RDMA WRITE 把 best prompt/result 写回
+  计算节点 result MR 的时间。
+- `client_overhead_avg_us`：端到端时间减去上述三段后的剩余控制面/调度开销。
+
+加 `--verbose` 会额外输出 total 的 p50/p95/p99 和各阶段 p50。
 
 默认测试模式只在 worker 启动时同步一次，然后各 worker 独立循环，和
 `rdma_prompt_read_latency.py` 的 steady 模式一致。需要复现“每一轮所有

@@ -69,6 +69,9 @@ struct AckWire {
     std::uint64_t request_id = 0;
     std::uint32_t result_bytes = 0;
     std::int32_t best_idx = -1;
+    double prompt_transfer_us = 0.0;
+    double server_match_us = 0.0;
+    double result_transfer_us = 0.0;
 };
 
 struct ResultHeaderWire {
