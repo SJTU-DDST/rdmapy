@@ -1204,13 +1204,17 @@ public:
                     }
                     measure_end_gate.arrive_and_wait();
                     if (send_done && opts_.completion_mode == "raw-poll") {
-                        try {
-                            worker.session->send_done_raw_poll();
-                        } catch (const std::exception& e) {
-                            spdlog::debug(
-                                "best-effort done send failed after measured "
-                                "READs: {}",
-                                e.what());
+                        for (int worker_id : worker_ids) {
+                            auto& worker =
+                                workers_[static_cast<std::size_t>(worker_id)];
+                            try {
+                                worker.session->send_done_raw_poll();
+                            } catch (const std::exception& e) {
+                                spdlog::debug(
+                                    "best-effort done send failed after "
+                                    "measured READs: {}",
+                                    e.what());
+                            }
                         }
                     }
                 } catch (...) {
