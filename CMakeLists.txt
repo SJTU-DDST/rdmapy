@@ -99,6 +99,70 @@ if(RDMAPY_BUILD_CXX_BENCHES)
         message(STATUS "CUDAToolkit not found: rdma_prompt_read_latency will support --memory host only")
     endif()
 
+    add_executable(rdma_read_matrix_latency
+        examples/rdma_read_matrix_latency.cc
+        src/rdma_read_bench_common.hpp
+        src/rdma_session.hpp
+    )
+
+    target_compile_features(rdma_read_matrix_latency PRIVATE cxx_std_20)
+
+    target_include_directories(rdma_read_matrix_latency
+        PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${RDMAPP_DIR}/examples/include
+    )
+
+    target_link_libraries(rdma_read_matrix_latency
+        PRIVATE
+        rdmapp_qp_helpers
+    )
+
+    add_executable(rdma_read_matrix_throughput
+        examples/rdma_read_matrix_throughput.cc
+        src/rdma_read_bench_common.hpp
+        src/rdma_session.hpp
+    )
+
+    target_compile_features(rdma_read_matrix_throughput PRIVATE cxx_std_20)
+
+    target_include_directories(rdma_read_matrix_throughput
+        PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${RDMAPP_DIR}/examples/include
+    )
+
+    target_link_libraries(rdma_read_matrix_throughput
+        PRIVATE
+        rdmapp_qp_helpers
+    )
+
+    if(CUDAToolkit_FOUND)
+        message(STATUS "CUDAToolkit found: enabling CUDA buffer mode for RDMA read matrix benches")
+        target_compile_definitions(rdma_read_matrix_latency PRIVATE RDMAPY_HAS_CUDA=1)
+        target_compile_definitions(rdma_read_matrix_throughput PRIVATE RDMAPY_HAS_CUDA=1)
+        target_link_libraries(rdma_read_matrix_latency PRIVATE CUDA::cudart)
+        target_link_libraries(rdma_read_matrix_throughput PRIVATE CUDA::cudart)
+    else()
+        message(STATUS "CUDAToolkit not found: RDMA read matrix benches will support --memory host only")
+    endif()
+
+    add_executable(rdma_server
+        server/server.cc
+    )
+
+    target_compile_features(rdma_server PRIVATE cxx_std_20)
+
+    target_include_directories(rdma_server
+        PRIVATE
+        ${RDMAPP_DIR}/examples/include
+    )
+
+    target_link_libraries(rdma_server
+        PRIVATE
+        rdmapp_qp_helpers
+    )
+
     add_executable(rdma_promptdb_server
         examples/rdma_promptdb_server.cc
         src/promptdb_lsh.hpp

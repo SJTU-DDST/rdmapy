@@ -3,6 +3,8 @@
 #include <asio/detached.hpp>
 #include <asio/this_coro.hpp>
 #include <asio/steady_timer.hpp>
+#include <chrono>
+#include <cctype>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
@@ -29,8 +31,8 @@ static std::vector<std::shared_ptr<rdmapp::qp>> g_qps;
 static std::vector<std::shared_ptr<std::vector<std::uint8_t>>> g_buffers;
 static std::vector<std::shared_ptr<rdmapp::local_mr>> g_mrs;
 
-constexpr int NUM_GLOBAL_MR = 64;
-constexpr std::size_t KV_BUFFER_SIZE = 2ull << 30;
+static int g_num_global_mr = 64;
+static std::size_t g_kv_buffer_size = 2ull << 30;
 
 // Maximum live QPs. Multi-QP bandwidth tests create one connection per QP.
 static int g_max_connections = 64;
@@ -53,13 +55,13 @@ void release_oldest_connection() {
 // ==============================
 static void init_global_mr_pool(std::shared_ptr<rdmapp::pd> pd) {
     spdlog::info("Pre-allocating {} buffers and registering MRs ({} bytes each)...",
-                 NUM_GLOBAL_MR, KV_BUFFER_SIZE);
+                 g_num_global_mr, g_kv_buffer_size);
 
-    g_buffers.reserve(NUM_GLOBAL_MR);
-    g_mrs.reserve(NUM_GLOBAL_MR);
+    g_buffers.reserve(static_cast<std::size_t>(g_num_global_mr));
+    g_mrs.reserve(static_cast<std::size_t>(g_num_global_mr));
 
-    for (int i = 0; i < NUM_GLOBAL_MR; i++) {
-        auto kv_buf = std::make_shared<std::vector<uint8_t>>(KV_BUFFER_SIZE);
+    for (int i = 0; i < g_num_global_mr; i++) {
+        auto kv_buf = std::make_shared<std::vector<uint8_t>>(g_kv_buffer_size);
 
         // 注意：这里用 pd 注册一次即可；后续连接只复用 MR 信息
         auto local_mr = std::make_shared<rdmapp::local_mr>(
@@ -149,6 +151,8 @@ struct ServerOptions {
     int ib_device = 0;
     int ib_port = 1;
     int max_connections = 64;
+    int mr_count = 64;
+    std::size_t mr_bytes = 2ull << 30;
 };
 
 static void print_usage(const char *prog) {
@@ -156,9 +160,10 @@ static void print_usage(const char *prog) {
         << "Usage:\n"
         << "  " << prog << " [port]\n"
         << "  " << prog << " --port PORT [--ib-device DEV] [--ib-port PORT] "
-        << "[--max-connections N]\n\n"
+        << "[--max-connections N] [--mr-count N] [--mr-bytes BYTES]\n\n"
         << "Defaults:\n"
-        << "  --port 2333 --ib-device 0 --ib-port 1 --max-connections 64\n";
+        << "  --port 2333 --ib-device 0 --ib-port 1 --max-connections 64\n"
+        << "  --mr-count 64 --mr-bytes 2g\n";
 }
 
 static int parse_int_arg(const std::string &name,
@@ -175,6 +180,59 @@ static int parse_int_arg(const std::string &name,
             throw std::out_of_range("outside allowed range");
         }
         return parsed;
+    } catch (const std::exception &e) {
+        throw std::runtime_error(
+            "invalid " + name + "=" + value + ": " + e.what());
+    }
+}
+
+static std::size_t parse_size_arg(const std::string &name,
+                                  const std::string &value) {
+    std::string text = value;
+    for (char &ch : text) {
+        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    }
+
+    std::uint64_t scale = 1;
+    auto strip_suffix = [&](const std::string &suffix,
+                            std::uint64_t suffix_scale) {
+        if (text.size() >= suffix.size() &&
+            text.compare(text.size() - suffix.size(),
+                         suffix.size(),
+                         suffix) == 0) {
+            text.resize(text.size() - suffix.size());
+            scale = suffix_scale;
+            return true;
+        }
+        return false;
+    };
+
+    constexpr std::uint64_t kib = 1024ull;
+    constexpr std::uint64_t mib = 1024ull * kib;
+    constexpr std::uint64_t gib = 1024ull * mib;
+    if (!strip_suffix("gb", gib) &&
+        !strip_suffix("g", gib) &&
+        !strip_suffix("mb", mib) &&
+        !strip_suffix("m", mib) &&
+        !strip_suffix("kb", kib)) {
+        strip_suffix("k", kib);
+    }
+
+    try {
+        size_t consumed = 0;
+        long double parsed = std::stold(text, &consumed);
+        if (consumed != text.size()) {
+            throw std::invalid_argument("trailing characters");
+        }
+        if (parsed <= 0.0L) {
+            throw std::out_of_range("must be positive");
+        }
+        long double bytes = parsed * static_cast<long double>(scale);
+        if (bytes > static_cast<long double>(
+                std::numeric_limits<std::size_t>::max())) {
+            throw std::out_of_range("too large");
+        }
+        return static_cast<std::size_t>(bytes);
     } catch (const std::exception &e) {
         throw std::runtime_error(
             "invalid " + name + "=" + value + ": " + e.what());
@@ -211,6 +269,11 @@ static ServerOptions parse_args(int argc, char *argv[]) {
         } else if (arg == "--max-connections") {
             opts.max_connections = parse_int_arg(
                 arg, require_value(arg), 1, std::numeric_limits<int>::max());
+        } else if (arg == "--mr-count") {
+            opts.mr_count = parse_int_arg(
+                arg, require_value(arg), 1, std::numeric_limits<int>::max());
+        } else if (arg == "--mr-bytes") {
+            opts.mr_bytes = parse_size_arg(arg, require_value(arg));
         } else if (!arg.empty() && arg[0] == '-') {
             throw std::runtime_error("unknown argument: " + arg);
         } else {
@@ -237,13 +300,17 @@ int main(int argc, char *argv[]) {
     }
 
     g_max_connections = opts.max_connections;
+    g_num_global_mr = opts.mr_count;
+    g_kv_buffer_size = opts.mr_bytes;
     spdlog::set_level(spdlog::level::debug);
     spdlog::info(
-        "Starting RDMA server on port {}, ib_device={}, ib_port={}, max_connections={}",
+        "Starting RDMA server on port {}, ib_device={}, ib_port={}, max_connections={}, mr_count={}, mr_bytes={}",
         opts.port,
         opts.ib_device,
         opts.ib_port,
-        opts.max_connections);
+        opts.max_connections,
+        opts.mr_count,
+        opts.mr_bytes);
 
     auto device = std::make_shared<rdmapp::device>(opts.ib_device, opts.ib_port);
     auto pd     = std::make_shared<rdmapp::pd>(device);

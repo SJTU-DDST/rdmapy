@@ -1,0 +1,225 @@
+#include "rdma_read_bench_common.hpp"
+
+#include <algorithm>
+#include <chrono>
+#include <cstdlib>
+#include <iomanip>
+#include <iostream>
+#include <limits>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <vector>
+
+namespace {
+
+using rdma_read_bench::Options;
+
+void print_usage(const char* prog) {
+    std::cout
+        << "Usage:\n"
+        << "  " << prog << " [options]\n\n"
+        << "Topology options:\n"
+        << "  --server-endpoints LIST     HOST:PORT[,HOST:PORT...]\n"
+        << "  --host HOST                 default: 127.0.0.1\n"
+        << "  --port PORT                 default: 2333\n"
+        << "  --clients N                 metadata for 2-client runs, default: 1\n"
+        << "  --client-id ID              metadata/offset partition, default: 0\n"
+        << "  --threads-per-server N      default: 16\n"
+        << "  --ib-devices LIST           local RDMA device list, e.g. 0,1\n"
+        << "  --ib-ports LIST             local RDMA port list, e.g. 1,1\n"
+        << "  --ib-device DEV             default: 0\n"
+        << "  --ib-port PORT              default: 1\n\n"
+        << "Payload options:\n"
+        << "  --payload-bytes BYTES       default: 4m; accepts k/m/g suffix\n"
+        << "  --prompt-bytes BYTES        alias for --payload-bytes\n"
+        << "  --memory cuda|host          default: "
+        << rdma_read_bench::kDefaultMemory << "\n"
+        << "  --cuda-device DEV           default: 0\n"
+        << "  --offset BYTES              default: 0\n"
+        << "  --stride BYTES              default: payload size\n\n"
+        << "Benchmark options:\n"
+        << "  --duration-sec SEC          measured duration, default: 10\n"
+        << "  --warmup-ops N              warmup READs per worker, default: 8\n"
+        << "  --trials N                  default: 1\n"
+        << "  --start-delay-sec SEC       sleep before connecting, default: 0\n"
+        << "  --stagger-us N              default: 0\n"
+        << "  --cpu-list LIST             pin local workers, e.g. 0,2,4,6\n"
+        << "  --completion-mode MODE      raw-poll|callback, default: raw-poll\n"
+        << "  --rdma-log-level LEVEL      trace/debug/info/warn/error/critical/off\n";
+}
+
+Options parse_args(int argc, char* argv[]) {
+    Options opts;
+    opts.payload_bytes = 4 * rdma_read_bench::kMiB;
+    opts.stride = 0;
+    opts.trials = 1;
+    opts.round_sync = false;
+
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (rdma_read_bench::is_blank_arg(arg)) {
+            rdma_read_bench::usage_error(
+                "blank argument detected. In shell commands, a "
+                "line-continuation backslash must be the final character on "
+                "the line");
+        }
+        if (arg == "-h" || arg == "--help") {
+            print_usage(argv[0]);
+            std::exit(0);
+        }
+
+        bool handled = false;
+        rdma_read_bench::parse_common_arg(opts, i, argc, argv, handled);
+        if (handled) {
+            continue;
+        }
+
+        if (arg == "--duration-sec") {
+            opts.duration_sec = rdma_read_bench::parse_double(
+                arg,
+                rdma_read_bench::take_value(i, argc, argv, arg),
+                0.001);
+        } else if (arg == "--warmup-ops") {
+            opts.warmup_ops = static_cast<int>(
+                rdma_read_bench::parse_ll(
+                    arg,
+                    rdma_read_bench::take_value(i, argc, argv, arg),
+                    0,
+                    std::numeric_limits<int>::max()));
+        } else if (arg == "--trials") {
+            opts.trials = static_cast<int>(
+                rdma_read_bench::parse_ll(
+                    arg,
+                    rdma_read_bench::take_value(i, argc, argv, arg),
+                    1,
+                    std::numeric_limits<int>::max()));
+        } else {
+            rdma_read_bench::usage_error("unknown argument: " + arg);
+        }
+    }
+
+    rdma_read_bench::finalize_options(
+        opts, 4 * rdma_read_bench::kMiB, 0);
+    return opts;
+}
+
+void print_throughput_row(const Options& opts,
+                          const std::string& section,
+                          int server_index,
+                          const std::string& endpoint,
+                          int threads,
+                          std::uint64_t ops,
+                          std::uint64_t bytes,
+                          double seconds) {
+    const double gbps = rdma_read_bench::bytes_to_gbps(bytes, seconds);
+    const double gibps = rdma_read_bench::bytes_to_gibps(bytes, seconds);
+    const double mops = seconds > 0.0
+        ? static_cast<double>(ops) / seconds / 1.0e6
+        : 0.0;
+
+    std::cout << section << ","
+              << opts.client_id << ","
+              << opts.clients << ","
+              << opts.server_hosts.size() << ","
+              << server_index << ","
+              << endpoint << ","
+              << threads << ","
+              << opts.payload_bytes << ","
+              << seconds << ","
+              << ops << ","
+              << bytes << ","
+              << gbps << ","
+              << gibps << ","
+              << mops
+              << "\n";
+}
+
+} // namespace
+
+int main(int argc, char* argv[]) {
+    try {
+        Options opts = parse_args(argc, argv);
+        rdma_read_bench::set_spdlog_level_from_name(opts.rdma_log_level);
+
+        std::cout << std::fixed << std::setprecision(4);
+        std::cout
+            << "# data_path=rdma_read_throughput_raw_poll"
+            << " clients=" << opts.clients
+            << " client_id=" << opts.client_id
+            << " servers=" << opts.server_hosts.size()
+            << " threads_per_server=" << opts.threads_per_server
+            << " total_local_threads="
+            << opts.threads_per_server *
+                   static_cast<int>(opts.server_hosts.size())
+            << " payload_bytes=" << opts.payload_bytes
+            << " duration_sec=" << opts.duration_sec
+            << " warmup_ops=" << opts.warmup_ops
+            << " trials=" << opts.trials
+            << "\n";
+        std::cout.flush();
+        if (opts.start_delay_sec > 0.0) {
+            std::this_thread::sleep_for(
+                std::chrono::duration<double>(opts.start_delay_sec));
+        }
+        std::cout
+            << "section,client_id,clients,servers,server_idx,endpoint,"
+            << "threads,payload_bytes,seconds,ops,bytes,gbps,gibps,mops\n";
+
+        std::vector<std::uint64_t> per_server_ops(opts.server_hosts.size(), 0);
+        std::vector<std::uint64_t> per_server_bytes(opts.server_hosts.size(), 0);
+        double accumulated_seconds = 0.0;
+        std::uint64_t total_ops = 0;
+        std::uint64_t total_bytes = 0;
+
+        for (int trial = 0; trial < opts.trials; ++trial) {
+            rdma_read_bench::MultiServerReadBench bench(opts);
+            auto results = bench.measure_throughput();
+
+            double trial_seconds = 0.0;
+            for (const auto& result : results) {
+                trial_seconds = std::max(trial_seconds, result.elapsed_sec);
+            }
+            accumulated_seconds += trial_seconds;
+
+            for (const auto& result : results) {
+                total_ops += result.ops;
+                total_bytes += result.bytes;
+                per_server_ops[static_cast<std::size_t>(result.server_index)] +=
+                    result.ops;
+                per_server_bytes[static_cast<std::size_t>(result.server_index)] +=
+                    result.bytes;
+            }
+        }
+
+        print_throughput_row(
+            opts,
+            "overall",
+            -1,
+            "all",
+            opts.threads_per_server *
+                static_cast<int>(opts.server_hosts.size()),
+            total_ops,
+            total_bytes,
+            accumulated_seconds);
+
+        for (int server_index = 0;
+             server_index < static_cast<int>(opts.server_hosts.size());
+             ++server_index) {
+            print_throughput_row(
+                opts,
+                "server",
+                server_index,
+                rdma_read_bench::endpoint_label(opts, server_index),
+                opts.threads_per_server,
+                per_server_ops[static_cast<std::size_t>(server_index)],
+                per_server_bytes[static_cast<std::size_t>(server_index)],
+                accumulated_seconds);
+        }
+        return 0;
+    } catch (const std::exception& e) {
+        std::cerr << "rdma_read_matrix_throughput failed: "
+                  << e.what() << "\n";
+        return 1;
+    }
+}
