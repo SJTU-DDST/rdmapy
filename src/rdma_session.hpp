@@ -128,6 +128,42 @@ public:
         mr_cache_misses_ = 0;
     }
 
+    void send_done_raw_poll() {
+        std::lock_guard<std::mutex> lk(done_mutex_);
+        if (done_sent_) {
+            return;
+        }
+
+        std::uint8_t done = 1;
+        auto local_mr = std::make_shared<rdmapp::local_mr>(
+            qp_->pd_ptr()->reg_mr(&done, sizeof(done)));
+
+        struct ibv_sge sge = {};
+        sge.addr = reinterpret_cast<std::uint64_t>(&done);
+        sge.length = sizeof(done);
+        sge.lkey = local_mr->lkey();
+
+        struct ibv_send_wr send_wr = {};
+        struct ibv_send_wr* bad_send_wr = nullptr;
+        send_wr.opcode = IBV_WR_SEND;
+        send_wr.next = nullptr;
+        send_wr.num_sge = 1;
+        send_wr.sg_list = &sge;
+        send_wr.wr_id = 1;
+        send_wr.send_flags = IBV_SEND_SIGNALED;
+
+        qp_->post_send(send_wr, bad_send_wr);
+        struct ibv_wc wc = {};
+        while (!qp_->poll_send_cq(wc)) {
+        }
+        if (wc.status != IBV_WC_SUCCESS) {
+            throw std::runtime_error(
+                std::string("done send failed: ") +
+                ibv_wc_status_str(wc.status));
+        }
+        done_sent_ = true;
+    }
+
     // 根据 offset 找 MR
     const remote_mr_info& find_region(uint64_t offset, uint64_t len) {
         if (len > total_len_ || offset > total_len_ - len) {
@@ -691,8 +727,10 @@ private:
     std::mutex mutex_;
     std::mutex send_mutex_;
     std::mutex post_mutex_;
+    std::mutex done_mutex_;
     std::condition_variable send_cv_;
     size_t outstanding_send_wrs_ = 0;
+    bool done_sent_ = false;
 
     static constexpr uint32_t kMaxSendWr = 128;
     static constexpr uint32_t kSendWrSlack = 1;

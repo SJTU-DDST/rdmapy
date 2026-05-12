@@ -1064,6 +1064,9 @@ public:
                             count,
                             count * opts_.payload_bytes,
                             elapsed_sec};
+                    if (opts_.completion_mode == "raw-poll") {
+                        worker.session->send_done_raw_poll();
+                    }
                 } catch (...) {
                     std::lock_guard<std::mutex> lk(exception_mutex);
                     if (!first_exception) {

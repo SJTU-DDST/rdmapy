@@ -3,6 +3,7 @@
 #include <asio/detached.hpp>
 #include <asio/this_coro.hpp>
 #include <asio/steady_timer.hpp>
+#include <algorithm>
 #include <chrono>
 #include <cctype>
 #include <cstdint>
@@ -36,9 +37,6 @@ static std::size_t g_kv_buffer_size = 2ull << 30;
 
 // Maximum live QPs. Multi-QP bandwidth tests create one connection per QP.
 static int g_max_connections = 64;
-
-// 简单背压：同一时间只允许一个 handle_qp 在跑
-static bool g_handling = false;
 
 // ==============================
 // 释放最旧连接（仅断开 QP，不再动 MR 池）
@@ -81,7 +79,16 @@ static void init_global_mr_pool(std::shared_ptr<rdmapp::pd> pd) {
 }
 
 // ==============================
-// 处理单个 QP：不再分配/注册 MR，只发送元数据
+static void remove_connection(const std::shared_ptr<rdmapp::qp>& qp) {
+    auto it = std::find(g_qps.begin(), g_qps.end(), qp);
+    if (it != g_qps.end()) {
+        g_qps.erase(it);
+        spdlog::debug("QP closed by client done signal; live_qps={}",
+                      g_qps.size());
+    }
+}
+
+// 处理单个 QP：发送元数据，然后等待 client done，自动释放连接
 // ==============================
 asio::awaitable<void> handle_qp(std::shared_ptr<rdmapp::qp> qp) {
     spdlog::info("Handling qp (KV server)");
@@ -99,6 +106,14 @@ asio::awaitable<void> handle_qp(std::shared_ptr<rdmapp::qp> qp) {
     }
 
     g_qps.push_back(qp);
+    try {
+        std::uint8_t done = 0;
+        auto span = std::as_writable_bytes(std::span(&done, 1));
+        co_await qp->recv(span);
+    } catch (const std::exception &e) {
+        spdlog::debug("QP done wait ended: {}", e.what());
+    }
+    remove_connection(qp);
     co_return;
 }
 
@@ -115,16 +130,6 @@ asio::awaitable<void> server(std::shared_ptr<rdmapp::qp_acceptor> acceptor) {
             release_oldest_connection();
         }
 
-        // 简单背压：如果上一个 handle_qp 还没结束，就稍微等一下
-        // （避免瞬间堆很多协程，CPU 抖动很大）
-        while (g_handling) {
-            asio::steady_timer t(ex);
-            t.expires_after(std::chrono::milliseconds(1));
-            co_await t.async_wait(asio::use_awaitable);
-        }
-
-        g_handling = true;
-
         asio::co_spawn(
             ex,
             [qp]() -> asio::awaitable<void> {
@@ -135,7 +140,6 @@ asio::awaitable<void> server(std::shared_ptr<rdmapp::qp_acceptor> acceptor) {
                 } catch (...) {
                     spdlog::error("handle_qp failed with unknown exception");
                 }
-                g_handling = false;
                 co_return;
             }(),
             asio::detached
