@@ -106,34 +106,12 @@ Options parse_args(int argc, char* argv[]) {
     return opts;
 }
 
-void print_throughput_row(const Options& opts,
-                          const std::string& section,
-                          int server_index,
-                          const std::string& endpoint,
-                          int threads,
-                          std::uint64_t ops,
+void print_throughput_row(int threads,
                           std::uint64_t bytes,
                           double seconds) {
     const double gbps = rdma_read_bench::bytes_to_gbps(bytes, seconds);
-    const double gibps = rdma_read_bench::bytes_to_gibps(bytes, seconds);
-    const double mops = seconds > 0.0
-        ? static_cast<double>(ops) / seconds / 1.0e6
-        : 0.0;
-
-    std::cout << section << ","
-              << opts.client_id << ","
-              << opts.clients << ","
-              << opts.server_hosts.size() << ","
-              << server_index << ","
-              << endpoint << ","
-              << threads << ","
-              << opts.payload_bytes << ","
-              << seconds << ","
-              << ops << ","
-              << bytes << ","
-              << gbps << ","
-              << gibps << ","
-              << mops
+    std::cout << threads << ","
+              << gbps
               << "\n";
 }
 
@@ -166,8 +144,7 @@ int main(int argc, char* argv[]) {
                 std::chrono::duration<double>(opts.start_delay_sec));
         }
         std::cout
-            << "section,client_id,clients,servers,server_idx,endpoint,"
-            << "threads,payload_bytes,seconds,ops,bytes,gbps,gibps,mops\n";
+            << "threads,gbps\n";
 
         for (int threads_per_server = opts.min_threads_per_server;
              threads_per_server <= opts.threads_per_server;
@@ -175,12 +152,7 @@ int main(int argc, char* argv[]) {
             Options run_opts = opts;
             run_opts.threads_per_server = threads_per_server;
 
-            std::vector<std::uint64_t> per_server_ops(
-                run_opts.server_hosts.size(), 0);
-            std::vector<std::uint64_t> per_server_bytes(
-                run_opts.server_hosts.size(), 0);
             double accumulated_seconds = 0.0;
-            std::uint64_t total_ops = 0;
             std::uint64_t total_bytes = 0;
 
             for (int trial = 0; trial < run_opts.trials; ++trial) {
@@ -195,42 +167,15 @@ int main(int argc, char* argv[]) {
                 accumulated_seconds += trial_seconds;
 
                 for (const auto& result : results) {
-                    total_ops += result.ops;
                     total_bytes += result.bytes;
-                    per_server_ops[
-                        static_cast<std::size_t>(result.server_index)] +=
-                        result.ops;
-                    per_server_bytes[
-                        static_cast<std::size_t>(result.server_index)] +=
-                        result.bytes;
                 }
             }
 
             print_throughput_row(
-                run_opts,
-                "overall",
-                -1,
-                "all",
                 run_opts.threads_per_server *
                     static_cast<int>(run_opts.server_hosts.size()),
-                total_ops,
                 total_bytes,
                 accumulated_seconds);
-
-            for (int server_index = 0;
-                 server_index <
-                     static_cast<int>(run_opts.server_hosts.size());
-                 ++server_index) {
-                print_throughput_row(
-                    run_opts,
-                    "server",
-                    server_index,
-                    rdma_read_bench::endpoint_label(run_opts, server_index),
-                    run_opts.threads_per_server,
-                    per_server_ops[static_cast<std::size_t>(server_index)],
-                    per_server_bytes[static_cast<std::size_t>(server_index)],
-                    accumulated_seconds);
-            }
         }
         return 0;
     } catch (const std::exception& e) {
