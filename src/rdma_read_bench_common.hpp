@@ -3,6 +3,7 @@
 #include "rdma_session.hpp"
 
 #include <algorithm>
+#include <barrier>
 #include <cerrno>
 #include <chrono>
 #include <cmath>
@@ -93,6 +94,12 @@ struct LatencySample {
 
 struct ThroughputWorkerResult {
     int server_index = 0;
+    std::uint64_t ops = 0;
+    std::uint64_t bytes = 0;
+    double elapsed_sec = 0.0;
+};
+
+struct ThroughputRunResult {
     std::uint64_t ops = 0;
     std::uint64_t bytes = 0;
     double elapsed_sec = 0.0;
@@ -1015,17 +1022,45 @@ public:
     }
 
     std::vector<ThroughputWorkerResult> measure_read_count(std::uint64_t count) {
+        auto run = measure_read_count_total(count);
+        std::vector<ThroughputWorkerResult> results(
+            static_cast<std::size_t>(total_threads()));
+        const int threads = total_threads();
+        const std::uint64_t per_worker_ops = count;
+        const std::uint64_t per_worker_bytes = count * opts_.payload_bytes;
+        for (int worker_id = 0; worker_id < threads; ++worker_id) {
+            auto& worker = workers_[static_cast<std::size_t>(worker_id)];
+            results[static_cast<std::size_t>(worker_id)] =
+                ThroughputWorkerResult{
+                    worker.server_index,
+                    per_worker_ops,
+                    per_worker_bytes,
+                    run.elapsed_sec};
+        }
+        return results;
+    }
+
+    ThroughputRunResult measure_read_count_total(std::uint64_t count) {
         if (count == 0) {
             throw std::runtime_error("read count must be positive");
         }
         const int threads = total_threads();
-        std::vector<ThroughputWorkerResult> results(
-            static_cast<std::size_t>(threads));
         StartGate start_gate(threads);
-        StartGate measure_gate(threads);
         std::vector<std::thread> thread_pool;
         std::mutex exception_mutex;
         std::exception_ptr first_exception;
+        std::chrono::steady_clock::time_point run_start;
+        std::chrono::steady_clock::time_point run_end;
+        std::barrier measure_start_gate(
+            static_cast<std::ptrdiff_t>(threads),
+            [&run_start] {
+                run_start = std::chrono::steady_clock::now();
+            });
+        std::barrier measure_end_gate(
+            static_cast<std::ptrdiff_t>(threads),
+            [&run_end] {
+                run_end = std::chrono::steady_clock::now();
+            });
         thread_pool.reserve(static_cast<std::size_t>(threads));
 
         for (int worker_id = 0; worker_id < threads; ++worker_id) {
@@ -1049,21 +1084,11 @@ public:
                         read_payload_once(worker, *local_buffer);
                     }
 
-                    measure_gate.arrive_and_wait();
-                    const auto start = std::chrono::steady_clock::now();
+                    measure_start_gate.arrive_and_wait();
                     for (std::uint64_t i = 0; i < count; ++i) {
                         read_payload_once(worker, *local_buffer);
                     }
-                    const auto end = std::chrono::steady_clock::now();
-
-                    const double elapsed_sec =
-                        std::chrono::duration<double>(end - start).count();
-                    results[static_cast<std::size_t>(worker_id)] =
-                        ThroughputWorkerResult{
-                            worker.server_index,
-                            count,
-                            count * opts_.payload_bytes,
-                            elapsed_sec};
+                    measure_end_gate.arrive_and_wait();
                     if (opts_.completion_mode == "raw-poll") {
                         worker.session->send_done_raw_poll();
                     }
@@ -1082,7 +1107,13 @@ public:
         if (first_exception) {
             std::rethrow_exception(first_exception);
         }
-        return results;
+
+        const double elapsed_sec =
+            std::chrono::duration<double>(run_end - run_start).count();
+        return ThroughputRunResult{
+            count * static_cast<std::uint64_t>(threads),
+            count * opts_.payload_bytes * static_cast<std::uint64_t>(threads),
+            elapsed_sec};
     }
 
 private:

@@ -205,15 +205,11 @@ int main(int argc, char* argv[]) {
 
             for (int trial = 0; trial < run_opts.trials; ++trial) {
                 rdma_read_bench::MultiServerReadBench bench(run_opts);
-                auto results = bench.measure_read_count(parsed.count);
-
-                double trial_gbps = 0.0;
-                for (const auto& result : results) {
-                    trial_gbps += rdma_read_bench::bytes_to_gbps(
+                auto result = bench.measure_read_count_total(parsed.count);
+                trial_gbps_values.push_back(
+                    rdma_read_bench::bytes_to_gbps(
                         result.bytes,
-                        result.elapsed_sec);
-                }
-                trial_gbps_values.push_back(trial_gbps);
+                        result.elapsed_sec));
             }
 
             const int total_threads =
