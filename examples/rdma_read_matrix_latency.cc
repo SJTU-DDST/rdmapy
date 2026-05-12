@@ -108,24 +108,10 @@ Options parse_args(int argc, char* argv[]) {
     return opts;
 }
 
-void print_latency_row(const Options& opts,
-                       const std::string& section,
-                       int server_index,
-                       const std::string& endpoint,
-                       int threads,
+void print_latency_row(int threads,
                        const std::vector<double>& values) {
-    std::cout << section << ","
-              << opts.client_id << ","
-              << opts.clients << ","
-              << opts.server_hosts.size() << ","
-              << server_index << ","
-              << endpoint << ","
-              << threads << ","
-              << opts.payload_bytes << ","
-              << rdma_read_bench::mean(values) << ","
-              << rdma_read_bench::percentile(values, 50) << ","
-              << rdma_read_bench::percentile(values, 95) << ","
-              << rdma_read_bench::percentile(values, 99)
+    std::cout << threads << ","
+              << rdma_read_bench::mean(values)
               << "\n";
 }
 
@@ -178,8 +164,7 @@ int main(int argc, char* argv[]) {
                 std::chrono::duration<double>(opts.start_delay_sec));
         }
         std::cout
-            << "section,client_id,clients,servers,server_idx,endpoint,"
-            << "threads,payload_bytes,avg_us,p50_us,p95_us,p99_us\n";
+            << "threads,avg_us\n";
 
         for (int threads_per_server = opts.min_threads_per_server;
              threads_per_server <= opts.threads_per_server;
@@ -199,27 +184,9 @@ int main(int argc, char* argv[]) {
             auto overall =
                 rdma_read_bench::latency_values(all_samples, -1);
             print_latency_row(
-                run_opts,
-                "overall",
-                -1,
-                "all",
                 run_opts.threads_per_server *
                     static_cast<int>(run_opts.server_hosts.size()),
                 overall);
-
-            for (int server_index = 0;
-                 server_index < static_cast<int>(run_opts.server_hosts.size());
-                 ++server_index) {
-                auto values =
-                    rdma_read_bench::latency_values(all_samples, server_index);
-                print_latency_row(
-                    run_opts,
-                    "server",
-                    server_index,
-                    rdma_read_bench::endpoint_label(run_opts, server_index),
-                    run_opts.threads_per_server,
-                    values);
-            }
         }
         return 0;
     } catch (const std::exception& e) {
