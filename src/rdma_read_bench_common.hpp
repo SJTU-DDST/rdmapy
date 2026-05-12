@@ -67,6 +67,7 @@ struct Options {
     std::uint64_t chunk_bytes = 0;
     std::uint32_t max_inflight = 16;
     std::uint32_t pipeline_depth = 1;
+    bool reuse_local_buffer = false;
     int repeats = 5000;
     int warmup = 500;
     int trials = 5;
@@ -557,6 +558,10 @@ inline void parse_common_arg(Options& opts,
         opts.pipeline_depth = static_cast<std::uint32_t>(
             parse_ll(arg, take_value(i, argc, argv, arg), 1,
                      std::numeric_limits<std::uint32_t>::max()));
+    } else if (arg == "--reuse-local-buffer") {
+        opts.reuse_local_buffer = true;
+    } else if (arg == "--no-reuse-local-buffer") {
+        opts.reuse_local_buffer = false;
     } else if (arg == "--io-workers") {
         opts.io_workers = static_cast<int>(
             parse_ll(arg, take_value(i, argc, argv, arg), 1,
@@ -690,12 +695,15 @@ private:
 #endif
 
 inline std::unique_ptr<LocalBuffer> make_buffer(const Options& opts) {
-    if (opts.pipeline_depth >
-        std::numeric_limits<std::uint64_t>::max() / opts.payload_bytes) {
-        throw std::runtime_error("local buffer size overflows uint64");
+    std::uint64_t buffer_bytes = opts.payload_bytes;
+    if (!opts.reuse_local_buffer) {
+        if (opts.pipeline_depth >
+            std::numeric_limits<std::uint64_t>::max() / opts.payload_bytes) {
+            throw std::runtime_error("local buffer size overflows uint64");
+        }
+        buffer_bytes =
+            opts.payload_bytes * static_cast<std::uint64_t>(opts.pipeline_depth);
     }
-    const std::uint64_t buffer_bytes =
-        opts.payload_bytes * static_cast<std::uint64_t>(opts.pipeline_depth);
     if (opts.memory == "host") {
         return std::make_unique<HostBuffer>(buffer_bytes);
     }
@@ -1078,6 +1086,7 @@ private:
                 opts_.payload_bytes,
                 opts_.chunk_bytes,
                 opts_.pipeline_depth,
+                opts_.reuse_local_buffer,
                 nullptr,
                 worker.buffer->length(),
                 opts_.max_inflight,

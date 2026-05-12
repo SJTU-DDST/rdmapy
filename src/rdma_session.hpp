@@ -474,6 +474,7 @@ public:
                    uint64_t length,
                    uint64_t chunk_bytes,
                    uint32_t repeat_count,
+                   bool reuse_local_buffer,
                    std::shared_ptr<void> owner = nullptr,
                    uint64_t register_length = 0,
                    uint32_t max_inflight = 16,
@@ -503,8 +504,9 @@ public:
             throw std::runtime_error(
                 "read_repeated_into_transfer_latency_us_raw_poll total local length overflows");
         }
-        const uint64_t total_local_length =
-            length * static_cast<uint64_t>(repeat_count);
+        const uint64_t total_local_length = reuse_local_buffer
+            ? length
+            : length * static_cast<uint64_t>(repeat_count);
         if (register_length == 0) {
             register_length = total_local_length;
         }
@@ -528,6 +530,7 @@ public:
             length,
             chunk_bytes,
             repeat_count,
+            reuse_local_buffer,
             local_mr,
             max_inflight);
         auto t1 = std::chrono::steady_clock::now();
@@ -1152,6 +1155,7 @@ private:
         uint64_t length,
         uint64_t chunk_bytes,
         uint32_t repeat_count,
+        bool reuse_local_buffer,
         std::shared_ptr<rdmapp::local_mr> local_mr,
         uint32_t max_inflight) {
         auto single_chunks = make_chunks(offset, length, chunk_bytes);
@@ -1164,7 +1168,7 @@ private:
                        static_cast<std::size_t>(repeat_count));
         for (uint32_t repeat = 0; repeat < repeat_count; ++repeat) {
             const uint64_t local_base =
-                static_cast<uint64_t>(repeat) * length;
+                reuse_local_buffer ? 0 : static_cast<uint64_t>(repeat) * length;
             for (auto chunk : single_chunks) {
                 chunk.local_offset += local_base;
                 chunks.push_back(chunk);

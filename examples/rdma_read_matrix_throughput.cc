@@ -38,6 +38,8 @@ void print_usage(const char* prog) {
         << "  --chunk-bytes BYTES         default: 4m\n"
         << "  --pipeline-depth N          default: 16 full payload READs per worker\n"
         << "  --max-inflight N            default: 16 outstanding READs per worker\n"
+        << "  --reuse-local-buffer        default; register one payload buffer per worker\n"
+        << "  --no-reuse-local-buffer     register pipeline_depth * payload bytes per worker\n"
         << "  --memory cuda|host          default: "
         << rdma_read_bench::kDefaultMemory << "\n"
         << "  --cuda-device DEV           default: 0\n"
@@ -60,6 +62,7 @@ Options parse_args(int argc, char* argv[]) {
     opts.chunk_bytes = 4 * rdma_read_bench::kMiB;
     opts.max_inflight = 16;
     opts.pipeline_depth = 16;
+    opts.reuse_local_buffer = true;
     opts.stride = 0;
     opts.trials = 1;
     opts.round_sync = false;
@@ -143,6 +146,8 @@ int main(int argc, char* argv[]) {
             << " chunk_bytes=" << opts.chunk_bytes
             << " max_inflight=" << opts.max_inflight
             << " pipeline_depth=" << opts.pipeline_depth
+            << " reuse_local_buffer="
+            << (opts.reuse_local_buffer ? "true" : "false")
             << " duration_sec=" << opts.duration_sec
             << " warmup_ops=" << opts.warmup_ops
             << " trials=" << opts.trials
