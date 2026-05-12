@@ -1014,6 +1014,73 @@ public:
         return results;
     }
 
+    std::vector<ThroughputWorkerResult> measure_read_count(std::uint64_t count) {
+        if (count == 0) {
+            throw std::runtime_error("read count must be positive");
+        }
+        const int threads = total_threads();
+        std::vector<ThroughputWorkerResult> results(
+            static_cast<std::size_t>(threads));
+        StartGate start_gate(threads);
+        StartGate measure_gate(threads);
+        std::vector<std::thread> thread_pool;
+        std::mutex exception_mutex;
+        std::exception_ptr first_exception;
+        thread_pool.reserve(static_cast<std::size_t>(threads));
+
+        for (int worker_id = 0; worker_id < threads; ++worker_id) {
+            thread_pool.emplace_back([&, worker_id] {
+                try {
+                    if (!opts_.cpu_list.empty()) {
+                        pin_current_thread_to_cpu(
+                            opts_.cpu_list[static_cast<std::size_t>(worker_id)]);
+                    }
+                    start_gate.arrive_and_wait();
+                    auto& worker = workers_[static_cast<std::size_t>(worker_id)];
+                    worker.buffer->activate();
+                    if (opts_.stagger_us > 0) {
+                        std::this_thread::sleep_for(
+                            std::chrono::microseconds(
+                                opts_.stagger_us *
+                                static_cast<std::int64_t>(worker_id)));
+                    }
+                    for (int i = 0; i < opts_.warmup_ops; ++i) {
+                        read_payload_once(worker);
+                    }
+
+                    measure_gate.arrive_and_wait();
+                    const auto start = std::chrono::steady_clock::now();
+                    for (std::uint64_t i = 0; i < count; ++i) {
+                        read_payload_once(worker);
+                    }
+                    const auto end = std::chrono::steady_clock::now();
+
+                    const double elapsed_sec =
+                        std::chrono::duration<double>(end - start).count();
+                    results[static_cast<std::size_t>(worker_id)] =
+                        ThroughputWorkerResult{
+                            worker.server_index,
+                            count,
+                            count * opts_.payload_bytes,
+                            elapsed_sec};
+                } catch (...) {
+                    std::lock_guard<std::mutex> lk(exception_mutex);
+                    if (!first_exception) {
+                        first_exception = std::current_exception();
+                    }
+                }
+            });
+        }
+
+        for (auto& thread : thread_pool) {
+            thread.join();
+        }
+        if (first_exception) {
+            std::rethrow_exception(first_exception);
+        }
+        return results;
+    }
+
 private:
     std::unique_ptr<RdmaEndpoint> make_endpoint(int server_index) const {
         const std::size_t config_id =
@@ -1104,6 +1171,29 @@ private:
             nullptr,
             worker.buffer->length(),
             opts_.max_inflight,
+            opts_.debug);
+    }
+
+    double read_payload_once(WorkerState& worker) const {
+        if (opts_.completion_mode == "raw-poll") {
+            return worker.session->read_into_transfer_latency_us_raw_poll(
+                worker.base_offset,
+                worker.buffer->addr(),
+                opts_.payload_bytes,
+                opts_.payload_bytes,
+                nullptr,
+                worker.buffer->length(),
+                1,
+                opts_.debug);
+        }
+        return worker.session->read_into_transfer_latency_us(
+            worker.base_offset,
+            worker.buffer->addr(),
+            opts_.payload_bytes,
+            opts_.payload_bytes,
+            nullptr,
+            worker.buffer->length(),
+            1,
             opts_.debug);
     }
 

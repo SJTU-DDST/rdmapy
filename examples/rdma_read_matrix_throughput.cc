@@ -15,6 +15,11 @@ namespace {
 
 using rdma_read_bench::Options;
 
+struct ReadBwOptions {
+    Options common;
+    std::uint64_t count = 3000;
+};
+
 void print_usage(const char* prog) {
     std::cout
         << "Usage:\n"
@@ -35,18 +40,11 @@ void print_usage(const char* prog) {
         << "Payload options:\n"
         << "  --payload-bytes BYTES       default: 4m; accepts k/m/g suffix\n"
         << "  --prompt-bytes BYTES        alias for --payload-bytes\n"
-        << "  --chunk-bytes BYTES         default: 4m\n"
-        << "  --pipeline-depth N          default: 16 full payload READs per worker\n"
-        << "  --max-inflight N            default: 16 outstanding READs per worker\n"
-        << "  --reuse-local-buffer        default; register one payload buffer per worker\n"
-        << "  --no-reuse-local-buffer     register pipeline_depth * payload bytes per worker\n"
-        << "  --memory cuda|host          default: "
-        << rdma_read_bench::kDefaultMemory << "\n"
-        << "  --cuda-device DEV           default: 0\n"
+        << "  --memory host               read_bw-compatible mode is host-memory only\n"
         << "  --offset BYTES              default: 0\n"
         << "  --stride BYTES              default: payload size\n\n"
         << "Benchmark options:\n"
-        << "  --duration-sec SEC          measured duration, default: 10\n"
+        << "  --count N                   4MB READs per worker, default: 3000\n"
         << "  --warmup-ops N              warmup READs per worker, default: 8\n"
         << "  --trials N                  default: 1\n"
         << "  --start-delay-sec SEC       sleep before connecting, default: 0\n"
@@ -56,12 +54,14 @@ void print_usage(const char* prog) {
         << "  --rdma-log-level LEVEL      trace/debug/info/warn/error/critical/off\n";
 }
 
-Options parse_args(int argc, char* argv[]) {
-    Options opts;
+ReadBwOptions parse_args(int argc, char* argv[]) {
+    ReadBwOptions parsed;
+    Options& opts = parsed.common;
+    opts.memory = "host";
     opts.payload_bytes = 4 * rdma_read_bench::kMiB;
     opts.chunk_bytes = 4 * rdma_read_bench::kMiB;
-    opts.max_inflight = 16;
-    opts.pipeline_depth = 16;
+    opts.max_inflight = 1;
+    opts.pipeline_depth = 1;
     opts.reuse_local_buffer = true;
     opts.stride = 0;
     opts.trials = 1;
@@ -86,7 +86,14 @@ Options parse_args(int argc, char* argv[]) {
             continue;
         }
 
-        if (arg == "--duration-sec") {
+        if (arg == "--count") {
+            parsed.count = static_cast<std::uint64_t>(
+                rdma_read_bench::parse_ll(
+                    arg,
+                    rdma_read_bench::take_value(i, argc, argv, arg),
+                    1,
+                    std::numeric_limits<long long>::max()));
+        } else if (arg == "--duration-sec") {
             opts.duration_sec = rdma_read_bench::parse_double(
                 arg,
                 rdma_read_bench::take_value(i, argc, argv, arg),
@@ -112,28 +119,25 @@ Options parse_args(int argc, char* argv[]) {
 
     rdma_read_bench::finalize_options(
         opts, 4 * rdma_read_bench::kMiB, 0);
-    return opts;
-}
-
-void print_throughput_row(int threads,
-                          std::uint64_t bytes,
-                          double seconds) {
-    const double gbps = rdma_read_bench::bytes_to_gbps(bytes, seconds);
-    std::cout << threads << ","
-              << gbps
-              << "\n";
+    if (opts.memory != "host") {
+        rdma_read_bench::usage_error(
+            "this read_bw-compatible throughput test is host-memory only; "
+            "remove --memory cuda or use --memory host");
+    }
+    return parsed;
 }
 
 } // namespace
 
 int main(int argc, char* argv[]) {
     try {
-        Options opts = parse_args(argc, argv);
+        ReadBwOptions parsed = parse_args(argc, argv);
+        Options opts = parsed.common;
         rdma_read_bench::set_spdlog_level_from_name(opts.rdma_log_level);
 
         std::cout << std::fixed << std::setprecision(4);
         std::cout
-            << "# data_path=rdma_read_throughput_raw_poll"
+            << "# data_path=rdma_read_bw_count_" << opts.completion_mode
             << " clients=" << opts.clients
             << " client_id=" << opts.client_id
             << " servers=" << opts.server_hosts.size()
@@ -143,12 +147,8 @@ int main(int argc, char* argv[]) {
             << opts.threads_per_server *
                    static_cast<int>(opts.server_hosts.size())
             << " payload_bytes=" << opts.payload_bytes
-            << " chunk_bytes=" << opts.chunk_bytes
-            << " max_inflight=" << opts.max_inflight
-            << " pipeline_depth=" << opts.pipeline_depth
-            << " reuse_local_buffer="
-            << (opts.reuse_local_buffer ? "true" : "false")
-            << " duration_sec=" << opts.duration_sec
+            << " memory=" << opts.memory
+            << " count=" << parsed.count
             << " warmup_ops=" << opts.warmup_ops
             << " trials=" << opts.trials
             << "\n";
@@ -165,31 +165,34 @@ int main(int argc, char* argv[]) {
              ++threads_per_server) {
             Options run_opts = opts;
             run_opts.threads_per_server = threads_per_server;
+            run_opts.chunk_bytes = run_opts.payload_bytes;
+            run_opts.max_inflight = 1;
+            run_opts.pipeline_depth = 1;
+            run_opts.reuse_local_buffer = true;
 
-            double accumulated_seconds = 0.0;
-            std::uint64_t total_bytes = 0;
+            double accumulated_gbps = 0.0;
 
             for (int trial = 0; trial < run_opts.trials; ++trial) {
                 rdma_read_bench::MultiServerReadBench bench(run_opts);
-                auto results = bench.measure_throughput();
+                auto results = bench.measure_read_count(parsed.count);
 
-                double trial_seconds = 0.0;
+                double trial_gbps = 0.0;
                 for (const auto& result : results) {
-                    trial_seconds = std::max(
-                        trial_seconds, result.elapsed_sec);
+                    trial_gbps += rdma_read_bench::bytes_to_gbps(
+                        result.bytes,
+                        result.elapsed_sec);
                 }
-                accumulated_seconds += trial_seconds;
-
-                for (const auto& result : results) {
-                    total_bytes += result.bytes;
-                }
+                accumulated_gbps += trial_gbps;
             }
 
-            print_throughput_row(
+            const int total_threads =
                 run_opts.threads_per_server *
-                    static_cast<int>(run_opts.server_hosts.size()),
-                total_bytes,
-                accumulated_seconds);
+                static_cast<int>(run_opts.server_hosts.size());
+            std::cout << total_threads << ","
+                      << accumulated_gbps /
+                             static_cast<double>(run_opts.trials)
+                      << "\n";
+            std::cout.flush();
         }
         return 0;
     } catch (const std::exception& e) {
