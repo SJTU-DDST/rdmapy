@@ -137,6 +137,24 @@ if(RDMAPY_BUILD_CXX_BENCHES)
         rdmapp_qp_helpers
     )
 
+    add_executable(rdma_send_matrix_throughput
+        examples/rdma_send_matrix_throughput.cc
+        src/rdma_read_bench_common.hpp
+    )
+
+    target_compile_features(rdma_send_matrix_throughput PRIVATE cxx_std_20)
+
+    target_include_directories(rdma_send_matrix_throughput
+        PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${RDMAPP_DIR}/examples/include
+    )
+
+    target_link_libraries(rdma_send_matrix_throughput
+        PRIVATE
+        rdmapp_qp_helpers
+    )
+
     if(CUDAToolkit_FOUND)
         message(STATUS "CUDAToolkit found: enabling CUDA buffer mode for RDMA read matrix benches")
         target_compile_definitions(rdma_read_matrix_latency PRIVATE RDMAPY_HAS_CUDA=1)
