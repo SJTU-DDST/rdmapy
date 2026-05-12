@@ -61,6 +61,7 @@ struct Options {
     int clients = 1;
     int min_threads_per_server = 1;
     int threads_per_server = 16;
+    int qps_per_thread = 1;
     int cuda_device = 0;
     std::string memory = kDefaultMemory;
     std::uint64_t offset = 0;
@@ -358,26 +359,35 @@ inline std::string endpoint_label(const Options& opts, int server_index) {
 inline std::vector<WorkerMapRow> expected_worker_map(const Options& opts) {
     std::vector<WorkerMapRow> rows;
     const int servers = static_cast<int>(opts.server_hosts.size());
-    rows.reserve(static_cast<std::size_t>(servers * opts.threads_per_server));
+    rows.reserve(static_cast<std::size_t>(
+        servers * opts.threads_per_server * opts.qps_per_thread));
     int worker_id = 0;
     for (int server_index = 0; server_index < servers; ++server_index) {
         for (int server_local_worker = 0;
              server_local_worker < opts.threads_per_server;
              ++server_local_worker) {
+            const int thread_id =
+                server_index * opts.threads_per_server + server_local_worker;
             const int cpu = opts.cpu_list.empty()
                 ? -1
-                : opts.cpu_list[static_cast<std::size_t>(worker_id)];
-            const std::uint64_t global_worker_on_server =
-                static_cast<std::uint64_t>(opts.client_id) *
-                    static_cast<std::uint64_t>(opts.threads_per_server) +
-                static_cast<std::uint64_t>(server_local_worker);
-            rows.push_back(WorkerMapRow{
-                worker_id,
-                server_index,
-                server_local_worker,
-                cpu,
-                opts.offset + global_worker_on_server * opts.stride});
-            ++worker_id;
+                : opts.cpu_list[static_cast<std::size_t>(thread_id)];
+            for (int qp_index = 0;
+                 qp_index < opts.qps_per_thread;
+                 ++qp_index) {
+                const std::uint64_t global_qp_on_server =
+                    static_cast<std::uint64_t>(opts.client_id) *
+                        static_cast<std::uint64_t>(
+                            opts.threads_per_server * opts.qps_per_thread) +
+                    static_cast<std::uint64_t>(
+                        server_local_worker * opts.qps_per_thread + qp_index);
+                rows.push_back(WorkerMapRow{
+                    worker_id,
+                    server_index,
+                    server_local_worker,
+                    cpu,
+                    opts.offset + global_qp_on_server * opts.stride});
+                ++worker_id;
+            }
         }
     }
     return rows;
@@ -455,6 +465,9 @@ inline void finalize_options(Options& opts,
     }
     if (opts.threads_per_server < 1) {
         usage_error("--threads-per-server must be positive");
+    }
+    if (opts.qps_per_thread < 1) {
+        usage_error("--qps-per-thread must be positive");
     }
     if (opts.min_threads_per_server < 1) {
         usage_error("--min-threads must be positive");
@@ -544,6 +557,10 @@ inline void parse_common_arg(Options& opts,
                arg == "--max-threads-per-server" ||
                arg == "--threads-per-server") {
         opts.threads_per_server = static_cast<int>(
+            parse_ll(arg, take_value(i, argc, argv, arg), 1,
+                     std::numeric_limits<int>::max()));
+    } else if (arg == "--qps-per-thread") {
+        opts.qps_per_thread = static_cast<int>(
             parse_ll(arg, take_value(i, argc, argv, arg), 1,
                      std::numeric_limits<int>::max()));
     } else if (arg == "--memory") {
@@ -795,8 +812,10 @@ private:
 };
 
 struct WorkerState {
+    int thread_id = 0;
     int server_index = 0;
     int server_local_worker = 0;
+    int qp_index = 0;
     std::shared_ptr<RdmaSession> session;
     std::unique_ptr<LocalBuffer> buffer;
     std::uint64_t base_offset = 0;
@@ -834,7 +853,7 @@ public:
         if (!opts_.cpu_list.empty()) {
             pin_current_thread_to_cpu(opts_.cpu_list.front());
         }
-        const int total_workers = total_threads();
+        const int total_workers = total_qps();
         const std::size_t configs = endpoint_config_count(opts_);
         shared_resources_.reserve(configs);
         for (std::size_t config_id = 0; config_id < configs; ++config_id) {
@@ -852,8 +871,16 @@ public:
             for (int local_worker = 0;
                  local_worker < opts_.threads_per_server;
                  ++local_worker) {
-                endpoints_.push_back(make_endpoint(server_index));
-                add_worker(server_index, local_worker, *endpoints_.back());
+                for (int qp_index = 0;
+                     qp_index < opts_.qps_per_thread;
+                     ++qp_index) {
+                    endpoints_.push_back(make_endpoint(server_index));
+                    add_worker(
+                        server_index,
+                        local_worker,
+                        qp_index,
+                        *endpoints_.back());
+                }
             }
         }
 
@@ -873,6 +900,10 @@ public:
         return num_servers() * opts_.threads_per_server;
     }
 
+    int total_qps() const {
+        return total_threads() * opts_.qps_per_thread;
+    }
+
     std::vector<WorkerMapRow> worker_map() const {
         std::vector<WorkerMapRow> rows;
         rows.reserve(workers_.size());
@@ -881,7 +912,7 @@ public:
             const auto& worker = workers_[worker_id];
             const int cpu = opts_.cpu_list.empty()
                 ? -1
-                : opts_.cpu_list[worker_id];
+                : opts_.cpu_list[static_cast<std::size_t>(worker.thread_id)];
             rows.push_back(WorkerMapRow{
                 static_cast<int>(worker_id),
                 worker.server_index,
@@ -1077,19 +1108,23 @@ public:
             throw std::runtime_error(
                 "active_threads_per_server is outside the configured range");
         }
-        const auto active_workers =
-            active_worker_indices(active_threads_per_server);
-        const int threads = static_cast<int>(active_workers.size());
+        const auto active_groups =
+            active_worker_groups(active_threads_per_server);
+        const int threads = static_cast<int>(active_groups.size());
         std::vector<std::uint64_t> per_server_bytes(
             static_cast<std::size_t>(num_servers()),
             0);
         std::vector<std::chrono::steady_clock::time_point> per_server_end(
             static_cast<std::size_t>(num_servers()));
         std::mutex per_server_end_mutex;
-        for (int worker_id : active_workers) {
-            const auto& worker = workers_[static_cast<std::size_t>(worker_id)];
-            per_server_bytes[static_cast<std::size_t>(worker.server_index)] +=
-                count * opts_.payload_bytes;
+        for (const auto& group : active_groups) {
+            for (int worker_id : group) {
+                const auto& worker =
+                    workers_[static_cast<std::size_t>(worker_id)];
+                per_server_bytes[
+                    static_cast<std::size_t>(worker.server_index)] +=
+                    count * opts_.payload_bytes;
+            }
         }
         StartGate start_gate(threads);
         std::vector<std::thread> thread_pool;
@@ -1115,36 +1150,53 @@ public:
         for (int active_id = 0; active_id < threads; ++active_id) {
             thread_pool.emplace_back([&, active_id] {
                 try {
-                    const int worker_id =
-                        active_workers[static_cast<std::size_t>(active_id)];
+                    const auto& worker_ids =
+                        active_groups[static_cast<std::size_t>(active_id)];
+                    const int first_worker_id = worker_ids.front();
+                    const auto& first_worker =
+                        workers_[static_cast<std::size_t>(first_worker_id)];
                     if (!opts_.cpu_list.empty()) {
                         pin_current_thread_to_cpu(
-                            opts_.cpu_list[static_cast<std::size_t>(worker_id)]);
+                            opts_.cpu_list[static_cast<std::size_t>(
+                                first_worker.thread_id)]);
                     }
                     start_gate.arrive_and_wait();
-                    auto& worker = workers_[static_cast<std::size_t>(worker_id)];
-                    auto local_buffer = make_buffer(opts_);
-                    local_buffer->activate();
+                    std::vector<std::unique_ptr<LocalBuffer>> local_buffers;
+                    local_buffers.reserve(worker_ids.size());
+                    for (std::size_t i = 0; i < worker_ids.size(); ++i) {
+                        local_buffers.push_back(make_buffer(opts_));
+                        local_buffers.back()->activate();
+                    }
                     if (opts_.stagger_us > 0) {
                         std::this_thread::sleep_for(
                             std::chrono::microseconds(
                                 opts_.stagger_us *
-                                static_cast<std::int64_t>(worker_id)));
+                                static_cast<std::int64_t>(first_worker_id)));
                     }
                     for (int i = 0; i < opts_.warmup_ops; ++i) {
-                        read_payload_once(worker, *local_buffer);
+                        for (std::size_t qp = 0; qp < worker_ids.size(); ++qp) {
+                            auto& worker =
+                                workers_[static_cast<std::size_t>(
+                                    worker_ids[qp])];
+                            read_payload_once(worker, *local_buffers[qp]);
+                        }
                     }
 
                     measure_start_gate.arrive_and_wait();
                     for (std::uint64_t i = 0; i < count; ++i) {
-                        read_payload_once(worker, *local_buffer);
+                        for (std::size_t qp = 0; qp < worker_ids.size(); ++qp) {
+                            auto& worker =
+                                workers_[static_cast<std::size_t>(
+                                    worker_ids[qp])];
+                            read_payload_once(worker, *local_buffers[qp]);
+                        }
                     }
                     const auto worker_end = std::chrono::steady_clock::now();
                     {
                         std::lock_guard<std::mutex> lk(per_server_end_mutex);
                         auto& server_end =
                             per_server_end[static_cast<std::size_t>(
-                                worker.server_index)];
+                                first_worker.server_index)];
                         if (server_end.time_since_epoch().count() == 0 ||
                             worker_end > server_end) {
                             server_end = worker_end;
@@ -1192,8 +1244,13 @@ public:
                     per_server_end[server_index] - run_start).count();
         }
         return ThroughputRunResult{
-            count * static_cast<std::uint64_t>(threads),
-            count * opts_.payload_bytes * static_cast<std::uint64_t>(threads),
+            count *
+                static_cast<std::uint64_t>(threads) *
+                static_cast<std::uint64_t>(opts_.qps_per_thread),
+            count *
+                opts_.payload_bytes *
+                static_cast<std::uint64_t>(threads) *
+                static_cast<std::uint64_t>(opts_.qps_per_thread),
             elapsed_sec,
             std::move(per_server_bytes),
             std::move(per_server_elapsed_sec)};
@@ -1216,19 +1273,30 @@ public:
     }
 
 private:
-    std::vector<int> active_worker_indices(int active_threads_per_server) const {
-        std::vector<int> indices;
-        indices.reserve(
+    std::vector<std::vector<int>> active_worker_groups(
+        int active_threads_per_server) const {
+        std::vector<std::vector<int>> groups;
+        groups.reserve(
             static_cast<std::size_t>(num_servers() * active_threads_per_server));
         for (int server_index = 0; server_index < num_servers(); ++server_index) {
-            const int server_base = server_index * opts_.threads_per_server;
+            const int server_base =
+                server_index * opts_.threads_per_server * opts_.qps_per_thread;
             for (int local_worker = 0;
                  local_worker < active_threads_per_server;
                  ++local_worker) {
-                indices.push_back(server_base + local_worker);
+                std::vector<int> group;
+                group.reserve(static_cast<std::size_t>(opts_.qps_per_thread));
+                const int thread_base =
+                    server_base + local_worker * opts_.qps_per_thread;
+                for (int qp_index = 0;
+                     qp_index < opts_.qps_per_thread;
+                     ++qp_index) {
+                    group.push_back(thread_base + qp_index);
+                }
+                groups.push_back(std::move(group));
             }
         }
-        return indices;
+        return groups;
     }
 
     std::unique_ptr<RdmaEndpoint> make_endpoint(int server_index) const {
@@ -1248,6 +1316,7 @@ private:
 
     void add_worker(int server_index,
                     int server_local_worker,
+                    int qp_index,
                     RdmaEndpoint& endpoint) {
         const std::size_t config_id =
             static_cast<std::size_t>(server_index) % endpoint_config_count(opts_);
@@ -1259,16 +1328,21 @@ private:
         session->set_mr_cache_limit(opts_.mr_cache_limit);
 
         WorkerState worker;
+        worker.thread_id =
+            server_index * opts_.threads_per_server + server_local_worker;
         worker.server_index = server_index;
         worker.server_local_worker = server_local_worker;
+        worker.qp_index = qp_index;
         worker.session = std::move(session);
         worker.buffer = make_buffer(opts_);
-        const std::uint64_t global_worker_on_server =
+        const std::uint64_t global_qp_on_server =
             static_cast<std::uint64_t>(opts_.client_id) *
-                static_cast<std::uint64_t>(opts_.threads_per_server) +
-            static_cast<std::uint64_t>(server_local_worker);
+                static_cast<std::uint64_t>(
+                    opts_.threads_per_server * opts_.qps_per_thread) +
+            static_cast<std::uint64_t>(
+                server_local_worker * opts_.qps_per_thread + qp_index);
         worker.base_offset =
-            opts_.offset + global_worker_on_server * opts_.stride;
+            opts_.offset + global_qp_on_server * opts_.stride;
         workers_.push_back(std::move(worker));
     }
 

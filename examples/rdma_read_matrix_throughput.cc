@@ -221,6 +221,7 @@ void print_usage(const char* prog) {
         << "  --min-threads N             per-server min, default: 1\n"
         << "  --max-threads N             per-server max, default: 16\n"
         << "  --threads-per-server N      alias for --max-threads\n"
+        << "  --qps-per-thread N          QPs opened by each local worker, default: 1\n"
         << "  --only-total-threads N      run exactly N total local threads\n"
         << "  --ib-devices LIST           local RDMA device list, e.g. 0,1\n"
         << "  --ib-ports LIST             local RDMA port list, e.g. 1,1\n"
@@ -446,6 +447,11 @@ int main(int argc, char* argv[]) {
                 << " max_total_local_threads="
                 << opts.threads_per_server *
                        static_cast<int>(opts.server_hosts.size())
+                << " qps_per_thread=" << opts.qps_per_thread
+                << " max_total_local_qps="
+                << opts.threads_per_server *
+                       static_cast<int>(opts.server_hosts.size()) *
+                       opts.qps_per_thread
                 << " only_total_threads=" << parsed.only_total_threads
                 << " payload_bytes=" << opts.payload_bytes
                 << " memory=" << opts.memory
