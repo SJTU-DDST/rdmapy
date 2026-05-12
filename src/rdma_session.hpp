@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <algorithm>
@@ -414,6 +415,125 @@ public:
             local_mr);
     }
 
+    double read_into_transfer_latency_us_raw_poll_windowed(
+                   uint64_t offset,
+                   std::uintptr_t local_addr,
+                   uint64_t length,
+                   uint64_t chunk_bytes,
+                   std::shared_ptr<void> owner = nullptr,
+                   uint64_t register_length = 0,
+                   uint32_t max_inflight = 16,
+                   bool debug = false) {
+        (void)debug;
+        if (length > total_len_ || offset > total_len_ - length) {
+            throw std::runtime_error(
+                "read_into_transfer_latency_us_raw_poll_windowed out of range");
+        }
+        if (length > 0 && local_addr == 0) {
+            throw std::runtime_error(
+                "read_into_transfer_latency_us_raw_poll_windowed got null local address");
+        }
+        if (chunk_bytes == 0) {
+            throw std::runtime_error(
+                "read_into_transfer_latency_us_raw_poll_windowed chunk_bytes must be > 0");
+        }
+        if (length == 0) {
+            return 0.0;
+        }
+        if (register_length == 0) {
+            register_length = length;
+        }
+        if (register_length < length) {
+            throw std::runtime_error(
+                "read_into_transfer_latency_us_raw_poll_windowed register_length is smaller than length");
+        }
+
+        std::shared_ptr<rdmapp::local_mr> local_mr;
+        {
+            std::lock_guard<std::mutex> lk(mutex_);
+            local_mr = get_cached_local_mr(
+                local_addr, register_length, std::move(owner));
+        }
+
+        auto t0 = std::chrono::steady_clock::now();
+        post_windowed_rdma_raw_poll(
+            IBV_WR_RDMA_READ,
+            offset,
+            local_addr,
+            length,
+            chunk_bytes,
+            local_mr,
+            max_inflight);
+        auto t1 = std::chrono::steady_clock::now();
+        return std::chrono::duration<double, std::micro>(t1 - t0).count();
+    }
+
+    double read_repeated_into_transfer_latency_us_raw_poll(
+                   uint64_t offset,
+                   std::uintptr_t local_addr,
+                   uint64_t length,
+                   uint64_t chunk_bytes,
+                   uint32_t repeat_count,
+                   std::shared_ptr<void> owner = nullptr,
+                   uint64_t register_length = 0,
+                   uint32_t max_inflight = 16,
+                   bool debug = false) {
+        (void)debug;
+        if (repeat_count == 0) {
+            throw std::runtime_error(
+                "read_repeated_into_transfer_latency_us_raw_poll repeat_count must be > 0");
+        }
+        if (length > total_len_ || offset > total_len_ - length) {
+            throw std::runtime_error(
+                "read_repeated_into_transfer_latency_us_raw_poll out of range");
+        }
+        if (length > 0 && local_addr == 0) {
+            throw std::runtime_error(
+                "read_repeated_into_transfer_latency_us_raw_poll got null local address");
+        }
+        if (chunk_bytes == 0) {
+            throw std::runtime_error(
+                "read_repeated_into_transfer_latency_us_raw_poll chunk_bytes must be > 0");
+        }
+        if (length == 0) {
+            return 0.0;
+        }
+        if (repeat_count >
+            std::numeric_limits<uint64_t>::max() / length) {
+            throw std::runtime_error(
+                "read_repeated_into_transfer_latency_us_raw_poll total local length overflows");
+        }
+        const uint64_t total_local_length =
+            length * static_cast<uint64_t>(repeat_count);
+        if (register_length == 0) {
+            register_length = total_local_length;
+        }
+        if (register_length < total_local_length) {
+            throw std::runtime_error(
+                "read_repeated_into_transfer_latency_us_raw_poll register_length is smaller than total local length");
+        }
+
+        std::shared_ptr<rdmapp::local_mr> local_mr;
+        {
+            std::lock_guard<std::mutex> lk(mutex_);
+            local_mr = get_cached_local_mr(
+                local_addr, register_length, std::move(owner));
+        }
+
+        auto t0 = std::chrono::steady_clock::now();
+        post_repeated_rdma_raw_poll(
+            IBV_WR_RDMA_READ,
+            offset,
+            local_addr,
+            length,
+            chunk_bytes,
+            repeat_count,
+            local_mr,
+            max_inflight);
+        auto t1 = std::chrono::steady_clock::now();
+        return std::chrono::duration<double, std::micro>(t1 - t0).count();
+    }
+
 
         // 同步 write，支持跨多个 MR
     void write(uint64_t offset, const uint8_t* data, size_t len) {
@@ -800,6 +920,8 @@ private:
         uint64_t length,
         uint64_t chunk_bytes) {
         std::vector<rdma_chunk> chunks;
+        chunks.reserve(static_cast<std::size_t>(
+            length / chunk_bytes + (length % chunk_bytes == 0 ? 0 : 1)));
         uint64_t cur_off = offset;
         uint64_t remaining = length;
         uint64_t local_offset = 0;
@@ -946,6 +1068,153 @@ private:
                 state->cv.wait(lk, [&state] { return state->done; });
                 if (state->exception) {
                     std::rethrow_exception(state->exception);
+                }
+            } catch (...) {
+                release_send_wrs(window_len);
+                throw;
+            }
+            release_send_wrs(window_len);
+        }
+        return chunks.size();
+    }
+
+    size_t post_windowed_rdma_raw_poll(
+        enum ibv_wr_opcode opcode,
+        uint64_t offset,
+        std::uintptr_t local_addr,
+        uint64_t length,
+        uint64_t chunk_bytes,
+        std::shared_ptr<rdmapp::local_mr> local_mr,
+        uint32_t max_inflight) {
+        auto chunks = make_chunks(offset, length, chunk_bytes);
+        if (chunks.empty()) {
+            return 0;
+        }
+
+        uint32_t window = effective_window(opcode, max_inflight);
+        for (size_t begin = 0; begin < chunks.size(); begin += window) {
+            size_t end = std::min<size_t>(begin + window, chunks.size());
+            size_t window_len = end - begin;
+            reserve_send_wrs(window_len);
+
+            try {
+                std::array<struct ibv_sge, kMaxSendWr> sges{};
+                std::array<struct ibv_send_wr, kMaxSendWr> send_wrs{};
+                for (size_t local_i = 0; local_i < window_len; ++local_i) {
+                    const auto& chunk = chunks[begin + local_i];
+                    const bool signaled = local_i + 1 == window_len;
+
+                    auto& sge = sges[local_i];
+                    sge = {};
+                    sge.addr =
+                        static_cast<uint64_t>(local_addr + chunk.local_offset);
+                    sge.length = chunk.bytes;
+                    sge.lkey = local_mr->lkey();
+
+                    auto& send_wr = send_wrs[local_i];
+                    send_wr = {};
+                    send_wr.opcode = opcode;
+                    send_wr.next = signaled ? nullptr : &send_wrs[local_i + 1];
+                    send_wr.num_sge = 1;
+                    send_wr.sg_list = &sge;
+                    send_wr.wr_id = signaled ? 1 : 0;
+                    send_wr.send_flags = signaled ? IBV_SEND_SIGNALED : 0;
+                    send_wr.wr.rdma.remote_addr =
+                        static_cast<uint64_t>(
+                            chunk.region->addr + chunk.in_mr_offset);
+                    send_wr.wr.rdma.rkey = chunk.region->rkey;
+                }
+
+                struct ibv_send_wr* bad_send_wr = nullptr;
+                qp_->post_send(send_wrs.front(), bad_send_wr);
+
+                struct ibv_wc wc = {};
+                while (!qp_->poll_send_cq(wc)) {
+                }
+                if (wc.status != IBV_WC_SUCCESS) {
+                    throw std::runtime_error(
+                        std::string("raw-poll windowed RDMA failed: ") +
+                        ibv_wc_status_str(wc.status));
+                }
+            } catch (...) {
+                release_send_wrs(window_len);
+                throw;
+            }
+            release_send_wrs(window_len);
+        }
+        return chunks.size();
+    }
+
+    size_t post_repeated_rdma_raw_poll(
+        enum ibv_wr_opcode opcode,
+        uint64_t offset,
+        std::uintptr_t local_addr,
+        uint64_t length,
+        uint64_t chunk_bytes,
+        uint32_t repeat_count,
+        std::shared_ptr<rdmapp::local_mr> local_mr,
+        uint32_t max_inflight) {
+        auto single_chunks = make_chunks(offset, length, chunk_bytes);
+        if (single_chunks.empty()) {
+            return 0;
+        }
+
+        std::vector<rdma_chunk> chunks;
+        chunks.reserve(single_chunks.size() *
+                       static_cast<std::size_t>(repeat_count));
+        for (uint32_t repeat = 0; repeat < repeat_count; ++repeat) {
+            const uint64_t local_base =
+                static_cast<uint64_t>(repeat) * length;
+            for (auto chunk : single_chunks) {
+                chunk.local_offset += local_base;
+                chunks.push_back(chunk);
+            }
+        }
+
+        uint32_t window = effective_window(opcode, max_inflight);
+        for (size_t begin = 0; begin < chunks.size(); begin += window) {
+            size_t end = std::min<size_t>(begin + window, chunks.size());
+            size_t window_len = end - begin;
+            reserve_send_wrs(window_len);
+
+            try {
+                std::array<struct ibv_sge, kMaxSendWr> sges{};
+                std::array<struct ibv_send_wr, kMaxSendWr> send_wrs{};
+                for (size_t local_i = 0; local_i < window_len; ++local_i) {
+                    const auto& chunk = chunks[begin + local_i];
+                    const bool signaled = local_i + 1 == window_len;
+
+                    auto& sge = sges[local_i];
+                    sge = {};
+                    sge.addr =
+                        static_cast<uint64_t>(local_addr + chunk.local_offset);
+                    sge.length = chunk.bytes;
+                    sge.lkey = local_mr->lkey();
+
+                    auto& send_wr = send_wrs[local_i];
+                    send_wr = {};
+                    send_wr.opcode = opcode;
+                    send_wr.next = signaled ? nullptr : &send_wrs[local_i + 1];
+                    send_wr.num_sge = 1;
+                    send_wr.sg_list = &sge;
+                    send_wr.wr_id = signaled ? 1 : 0;
+                    send_wr.send_flags = signaled ? IBV_SEND_SIGNALED : 0;
+                    send_wr.wr.rdma.remote_addr =
+                        static_cast<uint64_t>(
+                            chunk.region->addr + chunk.in_mr_offset);
+                    send_wr.wr.rdma.rkey = chunk.region->rkey;
+                }
+
+                struct ibv_send_wr* bad_send_wr = nullptr;
+                qp_->post_send(send_wrs.front(), bad_send_wr);
+
+                struct ibv_wc wc = {};
+                while (!qp_->poll_send_cq(wc)) {
+                }
+                if (wc.status != IBV_WC_SUCCESS) {
+                    throw std::runtime_error(
+                        std::string("raw-poll repeated RDMA failed: ") +
+                        ibv_wc_status_str(wc.status));
                 }
             } catch (...) {
                 release_send_wrs(window_len);

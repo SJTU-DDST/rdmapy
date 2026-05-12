@@ -35,6 +35,9 @@ void print_usage(const char* prog) {
         << "Payload options:\n"
         << "  --payload-bytes BYTES       default: 4m; accepts k/m/g suffix\n"
         << "  --prompt-bytes BYTES        alias for --payload-bytes\n"
+        << "  --chunk-bytes BYTES         default: 4m\n"
+        << "  --pipeline-depth N          default: 16 full payload READs per worker\n"
+        << "  --max-inflight N            default: 16 outstanding READs per worker\n"
         << "  --memory cuda|host          default: "
         << rdma_read_bench::kDefaultMemory << "\n"
         << "  --cuda-device DEV           default: 0\n"
@@ -54,6 +57,9 @@ void print_usage(const char* prog) {
 Options parse_args(int argc, char* argv[]) {
     Options opts;
     opts.payload_bytes = 4 * rdma_read_bench::kMiB;
+    opts.chunk_bytes = 4 * rdma_read_bench::kMiB;
+    opts.max_inflight = 16;
+    opts.pipeline_depth = 16;
     opts.stride = 0;
     opts.trials = 1;
     opts.round_sync = false;
@@ -134,6 +140,9 @@ int main(int argc, char* argv[]) {
             << opts.threads_per_server *
                    static_cast<int>(opts.server_hosts.size())
             << " payload_bytes=" << opts.payload_bytes
+            << " chunk_bytes=" << opts.chunk_bytes
+            << " max_inflight=" << opts.max_inflight
+            << " pipeline_depth=" << opts.pipeline_depth
             << " duration_sec=" << opts.duration_sec
             << " warmup_ops=" << opts.warmup_ops
             << " trials=" << opts.trials

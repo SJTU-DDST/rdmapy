@@ -64,6 +64,9 @@ struct Options {
     std::uint64_t offset = 0;
     std::uint64_t stride = 0;
     std::uint64_t payload_bytes = 128;
+    std::uint64_t chunk_bytes = 0;
+    std::uint32_t max_inflight = 16;
+    std::uint32_t pipeline_depth = 1;
     int repeats = 5000;
     int warmup = 500;
     int trials = 5;
@@ -404,6 +407,9 @@ inline void finalize_options(Options& opts,
     if (opts.payload_bytes == 0) {
         opts.payload_bytes = default_payload_bytes;
     }
+    if (opts.chunk_bytes == 0) {
+        opts.chunk_bytes = opts.payload_bytes;
+    }
     if (opts.stride == 0) {
         opts.stride = default_stride == 0 ? opts.payload_bytes
                                           : default_stride;
@@ -414,6 +420,18 @@ inline void finalize_options(Options& opts,
     if (opts.payload_bytes > static_cast<std::uint64_t>(
             std::numeric_limits<std::size_t>::max())) {
         usage_error("payload size exceeds size_t");
+    }
+    if (opts.chunk_bytes == 0) {
+        usage_error("--chunk-bytes must be positive");
+    }
+    if (opts.chunk_bytes > opts.payload_bytes) {
+        usage_error("--chunk-bytes must be <= payload size");
+    }
+    if (opts.max_inflight == 0) {
+        usage_error("--max-inflight must be positive");
+    }
+    if (opts.pipeline_depth == 0) {
+        usage_error("--pipeline-depth must be positive");
     }
     if (opts.stride < opts.payload_bytes) {
         usage_error("--stride must be >= payload size");
@@ -529,6 +547,16 @@ inline void parse_common_arg(Options& opts,
         opts.stride = parse_size(take_value(i, argc, argv, arg));
     } else if (arg == "--payload-bytes" || arg == "--prompt-bytes") {
         opts.payload_bytes = parse_size(take_value(i, argc, argv, arg));
+    } else if (arg == "--chunk-bytes") {
+        opts.chunk_bytes = parse_size(take_value(i, argc, argv, arg));
+    } else if (arg == "--max-inflight") {
+        opts.max_inflight = static_cast<std::uint32_t>(
+            parse_ll(arg, take_value(i, argc, argv, arg), 1,
+                     std::numeric_limits<std::uint32_t>::max()));
+    } else if (arg == "--pipeline-depth") {
+        opts.pipeline_depth = static_cast<std::uint32_t>(
+            parse_ll(arg, take_value(i, argc, argv, arg), 1,
+                     std::numeric_limits<std::uint32_t>::max()));
     } else if (arg == "--io-workers") {
         opts.io_workers = static_cast<int>(
             parse_ll(arg, take_value(i, argc, argv, arg), 1,
@@ -662,12 +690,18 @@ private:
 #endif
 
 inline std::unique_ptr<LocalBuffer> make_buffer(const Options& opts) {
+    if (opts.pipeline_depth >
+        std::numeric_limits<std::uint64_t>::max() / opts.payload_bytes) {
+        throw std::runtime_error("local buffer size overflows uint64");
+    }
+    const std::uint64_t buffer_bytes =
+        opts.payload_bytes * static_cast<std::uint64_t>(opts.pipeline_depth);
     if (opts.memory == "host") {
-        return std::make_unique<HostBuffer>(opts.payload_bytes);
+        return std::make_unique<HostBuffer>(buffer_bytes);
     }
 
 #ifdef RDMAPY_HAS_CUDA
-    return std::make_unique<CudaBuffer>(opts.payload_bytes, opts.cuda_device);
+    return std::make_unique<CudaBuffer>(buffer_bytes, opts.cuda_device);
 #else
     throw std::runtime_error(
         "this binary was built without CUDA support; rerun with --memory host "
@@ -942,7 +976,7 @@ public:
                     auto now = start;
                     do {
                         read_once(worker);
-                        ++ops;
+                        ops += opts_.pipeline_depth;
                         now = std::chrono::steady_clock::now();
                     } while (now < deadline);
 
@@ -1026,24 +1060,41 @@ private:
 
     double read_once(WorkerState& worker) const {
         if (opts_.completion_mode == "raw-poll") {
-            return worker.session->read_into_transfer_latency_us_raw_poll(
+            if (opts_.pipeline_depth == 1 &&
+                opts_.chunk_bytes >= opts_.payload_bytes) {
+                return worker.session->read_into_transfer_latency_us_raw_poll(
+                    worker.base_offset,
+                    worker.buffer->addr(),
+                    opts_.payload_bytes,
+                    opts_.payload_bytes,
+                    nullptr,
+                    worker.buffer->length(),
+                    1,
+                    opts_.debug);
+            }
+            return worker.session->read_repeated_into_transfer_latency_us_raw_poll(
                 worker.base_offset,
                 worker.buffer->addr(),
                 opts_.payload_bytes,
-                opts_.payload_bytes,
+                opts_.chunk_bytes,
+                opts_.pipeline_depth,
                 nullptr,
                 worker.buffer->length(),
-                1,
+                opts_.max_inflight,
                 opts_.debug);
+        }
+        if (opts_.pipeline_depth != 1) {
+            throw std::runtime_error(
+                "--pipeline-depth > 1 is only supported with raw-poll");
         }
         return worker.session->read_into_transfer_latency_us(
             worker.base_offset,
             worker.buffer->addr(),
             opts_.payload_bytes,
-            opts_.payload_bytes,
+            opts_.chunk_bytes,
             nullptr,
             worker.buffer->length(),
-            1,
+            opts_.max_inflight,
             opts_.debug);
     }
 
