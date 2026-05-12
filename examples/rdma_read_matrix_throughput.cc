@@ -1,19 +1,42 @@
 #include "rdma_read_bench_common.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
+#include <cstddef>
 #include <cstdlib>
+#include <cstring>
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
 
+#include <asio/connect.hpp>
+#include <asio/ip/tcp.hpp>
+#include <asio/read.hpp>
+#include <asio/write.hpp>
+
 namespace {
 
 using rdma_read_bench::Options;
+
+constexpr std::uint64_t kSyncMagic = 0x52444d4153594e43ull; // RDMASYNC
+constexpr std::uint32_t kSyncKindBarrier = 1;
+constexpr std::uint32_t kSyncKindStats = 2;
+
+struct SyncWire {
+    std::uint64_t magic = kSyncMagic;
+    std::uint32_t kind = 0;
+    std::uint32_t reserved = 0;
+    std::uint64_t phase = 0;
+    std::uint64_t threads = 0;
+    std::uint64_t bytes = 0;
+    std::uint64_t elapsed_ns = 0;
+};
 
 struct ReadBwOptions {
     Options common;
@@ -22,6 +45,166 @@ struct ReadBwOptions {
     std::string trial_reducer = "mean";
     int only_total_threads = 0;
     bool prewarm_count_set = false;
+    std::string sync_role = "none";
+    std::string sync_host = "127.0.0.1";
+    std::uint16_t sync_port = 2444;
+    int sync_clients = 2;
+    std::string sync_output = "local";
+};
+
+class CrossClientSync {
+public:
+    explicit CrossClientSync(const ReadBwOptions& opts)
+        : role_(opts.sync_role),
+          output_(opts.sync_output) {
+        if (role_ == "none") {
+            return;
+        }
+        if (role_ == "server") {
+            asio::ip::tcp::acceptor acceptor(
+                io_ctx_,
+                {asio::ip::tcp::v4(), opts.sync_port});
+            const int peers = opts.sync_clients - 1;
+            sockets_.reserve(static_cast<std::size_t>(peers));
+            for (int i = 0; i < peers; ++i) {
+                sockets_.emplace_back(io_ctx_);
+                acceptor.accept(sockets_.back());
+            }
+            return;
+        }
+        if (role_ == "client") {
+            asio::ip::tcp::resolver resolver(io_ctx_);
+            auto endpoints = resolver.resolve(
+                opts.sync_host,
+                std::to_string(opts.sync_port));
+            sockets_.emplace_back(io_ctx_);
+            asio::connect(sockets_.back(), endpoints);
+            return;
+        }
+        throw std::runtime_error("--sync-role must be none, server, or client");
+    }
+
+    bool should_print() const {
+        if (role_ == "none") {
+            return true;
+        }
+        if (output_ == "local") {
+            return true;
+        }
+        return role_ == "server" && output_ == "aggregate";
+    }
+
+    void begin_phase(std::uint64_t phase) {
+        if (role_ == "none") {
+            return;
+        }
+        if (role_ == "server") {
+            for (auto& socket : sockets_) {
+                SyncWire wire{};
+                read_wire(socket, wire);
+                validate_wire(wire, kSyncKindBarrier, phase);
+            }
+            SyncWire release{};
+            release.kind = kSyncKindBarrier;
+            release.phase = phase;
+            phase_start_ = std::chrono::steady_clock::now();
+            for (auto& socket : sockets_) {
+                write_wire(socket, release);
+            }
+            return;
+        }
+
+        SyncWire wire{};
+        wire.kind = kSyncKindBarrier;
+        wire.phase = phase;
+        write_wire(sockets_.front(), wire);
+        SyncWire release{};
+        read_wire(sockets_.front(), release);
+        validate_wire(release, kSyncKindBarrier, phase);
+    }
+
+    std::optional<double> report(std::uint64_t phase,
+                                 std::uint64_t threads,
+                                 std::uint64_t bytes,
+                                 double elapsed_sec) {
+        if (role_ == "none") {
+            return rdma_read_bench::bytes_to_gbps(bytes, elapsed_sec);
+        }
+
+        const std::uint64_t elapsed_ns =
+            static_cast<std::uint64_t>(elapsed_sec * 1.0e9);
+        if (role_ == "client") {
+            SyncWire stats{};
+            stats.kind = kSyncKindStats;
+            stats.phase = phase;
+            stats.threads = threads;
+            stats.bytes = bytes;
+            stats.elapsed_ns = elapsed_ns;
+            write_wire(sockets_.front(), stats);
+            SyncWire release{};
+            read_wire(sockets_.front(), release);
+            validate_wire(release, kSyncKindStats, phase);
+            if (output_ == "local") {
+                return rdma_read_bench::bytes_to_gbps(bytes, elapsed_sec);
+            }
+            return std::nullopt;
+        }
+
+        std::uint64_t total_bytes = bytes;
+        for (auto& socket : sockets_) {
+            SyncWire stats{};
+            read_wire(socket, stats);
+            validate_wire(stats, kSyncKindStats, phase);
+            if (stats.threads != threads) {
+                throw std::runtime_error(
+                    "sync peer reported a different thread count");
+            }
+            total_bytes += stats.bytes;
+        }
+        const auto phase_end = std::chrono::steady_clock::now();
+        SyncWire release{};
+        release.kind = kSyncKindStats;
+        release.phase = phase;
+        for (auto& socket : sockets_) {
+            write_wire(socket, release);
+        }
+        if (output_ == "aggregate") {
+            return rdma_read_bench::bytes_to_gbps(
+                total_bytes,
+                std::chrono::duration<double>(phase_end - phase_start_).count());
+        }
+        if (output_ == "local") {
+            return rdma_read_bench::bytes_to_gbps(bytes, elapsed_sec);
+        }
+        return std::nullopt;
+    }
+
+private:
+    static void write_wire(asio::ip::tcp::socket& socket,
+                           const SyncWire& wire) {
+        asio::write(socket, asio::buffer(&wire, sizeof(wire)));
+    }
+
+    static void read_wire(asio::ip::tcp::socket& socket,
+                          SyncWire& wire) {
+        asio::read(socket, asio::buffer(&wire, sizeof(wire)));
+    }
+
+    static void validate_wire(const SyncWire& wire,
+                              std::uint32_t expected_kind,
+                              std::uint64_t expected_phase) {
+        if (wire.magic != kSyncMagic ||
+            wire.kind != expected_kind ||
+            wire.phase != expected_phase) {
+            throw std::runtime_error("bad cross-client sync message");
+        }
+    }
+
+    std::string role_;
+    std::string output_;
+    std::chrono::steady_clock::time_point phase_start_;
+    asio::io_context io_ctx_;
+    std::vector<asio::ip::tcp::socket> sockets_;
 };
 
 void print_usage(const char* prog) {
@@ -58,7 +241,13 @@ void print_usage(const char* prog) {
         << "  --stagger-us N              default: 0\n"
         << "  --cpu-list LIST             pin local workers, e.g. 0,2,4,6\n"
         << "  --completion-mode MODE      raw-poll|callback, default: raw-poll\n"
-        << "  --rdma-log-level LEVEL      trace/debug/info/warn/error/critical/off\n";
+        << "  --rdma-log-level LEVEL      trace/debug/info/warn/error/critical/off\n"
+        << "Cross-client aggregate options:\n"
+        << "  --sync-role none|server|client  default: none\n"
+        << "  --sync-host HOST                sync server host for client role\n"
+        << "  --sync-port PORT                default: 2444\n"
+        << "  --sync-clients N                default: 2\n"
+        << "  --sync-output local|aggregate|none  default: local\n";
 }
 
 ReadBwOptions parse_args(int argc, char* argv[]) {
@@ -137,6 +326,28 @@ ReadBwOptions parse_args(int argc, char* argv[]) {
                     rdma_read_bench::take_value(i, argc, argv, arg),
                     1,
                     std::numeric_limits<int>::max()));
+        } else if (arg == "--sync-role") {
+            parsed.sync_role = rdma_read_bench::lower_copy(
+                rdma_read_bench::take_value(i, argc, argv, arg));
+        } else if (arg == "--sync-host") {
+            parsed.sync_host = rdma_read_bench::take_value(i, argc, argv, arg);
+        } else if (arg == "--sync-port") {
+            parsed.sync_port = static_cast<std::uint16_t>(
+                rdma_read_bench::parse_ll(
+                    arg,
+                    rdma_read_bench::take_value(i, argc, argv, arg),
+                    1,
+                    65535));
+        } else if (arg == "--sync-clients") {
+            parsed.sync_clients = static_cast<int>(
+                rdma_read_bench::parse_ll(
+                    arg,
+                    rdma_read_bench::take_value(i, argc, argv, arg),
+                    2,
+                    std::numeric_limits<int>::max()));
+        } else if (arg == "--sync-output") {
+            parsed.sync_output = rdma_read_bench::lower_copy(
+                rdma_read_bench::take_value(i, argc, argv, arg));
         } else {
             rdma_read_bench::usage_error("unknown argument: " + arg);
         }
@@ -154,6 +365,18 @@ ReadBwOptions parse_args(int argc, char* argv[]) {
         parsed.trial_reducer != "mean") {
         rdma_read_bench::usage_error(
             "--trial-reducer must be max, median, or mean");
+    }
+    if (parsed.sync_role != "none" &&
+        parsed.sync_role != "server" &&
+        parsed.sync_role != "client") {
+        rdma_read_bench::usage_error(
+            "--sync-role must be none, server, or client");
+    }
+    if (parsed.sync_output != "local" &&
+        parsed.sync_output != "aggregate" &&
+        parsed.sync_output != "none") {
+        rdma_read_bench::usage_error(
+            "--sync-output must be local, aggregate, or none");
     }
     if (parsed.only_total_threads > 0) {
         const int servers = static_cast<int>(opts.server_hosts.size());
@@ -205,34 +428,41 @@ int main(int argc, char* argv[]) {
         ReadBwOptions parsed = parse_args(argc, argv);
         Options opts = parsed.common;
         rdma_read_bench::set_spdlog_level_from_name(opts.rdma_log_level);
+        CrossClientSync sync(parsed);
 
         std::cout << std::fixed << std::setprecision(4);
-        std::cout
-            << "# data_path=rdma_read_bw_count_" << opts.completion_mode
-            << " clients=" << opts.clients
-            << " client_id=" << opts.client_id
-            << " servers=" << opts.server_hosts.size()
-            << " min_threads_per_server=" << opts.min_threads_per_server
-            << " max_threads_per_server=" << opts.threads_per_server
-            << " max_total_local_threads="
-            << opts.threads_per_server *
-                   static_cast<int>(opts.server_hosts.size())
-            << " only_total_threads=" << parsed.only_total_threads
-            << " payload_bytes=" << opts.payload_bytes
-            << " memory=" << opts.memory
-            << " count=" << parsed.count
-            << " prewarm_count=" << parsed.prewarm_count
-            << " warmup_ops=" << opts.warmup_ops
-            << " trials=" << opts.trials
-            << " trial_reducer=" << parsed.trial_reducer
-            << "\n";
-        std::cout.flush();
+        if (sync.should_print()) {
+            std::cout
+                << "# data_path=rdma_read_bw_count_" << opts.completion_mode
+                << " clients=" << opts.clients
+                << " client_id=" << opts.client_id
+                << " servers=" << opts.server_hosts.size()
+                << " min_threads_per_server=" << opts.min_threads_per_server
+                << " max_threads_per_server=" << opts.threads_per_server
+                << " max_total_local_threads="
+                << opts.threads_per_server *
+                       static_cast<int>(opts.server_hosts.size())
+                << " only_total_threads=" << parsed.only_total_threads
+                << " payload_bytes=" << opts.payload_bytes
+                << " memory=" << opts.memory
+                << " count=" << parsed.count
+                << " prewarm_count=" << parsed.prewarm_count
+                << " warmup_ops=" << opts.warmup_ops
+                << " trials=" << opts.trials
+                << " trial_reducer=" << parsed.trial_reducer
+                << " sync_role=" << parsed.sync_role
+                << " sync_output=" << parsed.sync_output
+                << "\n";
+            std::cout.flush();
+        }
         if (opts.start_delay_sec > 0.0) {
             std::this_thread::sleep_for(
                 std::chrono::duration<double>(opts.start_delay_sec));
         }
-        std::cout
-            << "threads,gbps\n";
+        if (sync.should_print()) {
+            std::cout << "threads,gbps\n";
+        }
+        std::uint64_t phase = 0;
 
         for (int threads_per_server = opts.min_threads_per_server;
              threads_per_server <= opts.threads_per_server;
@@ -246,7 +476,19 @@ int main(int argc, char* argv[]) {
 
             if (parsed.prewarm_count > 0) {
                 rdma_read_bench::MultiServerReadBench warmup_bench(run_opts);
-                (void)warmup_bench.measure_read_count_total(parsed.prewarm_count);
+                const std::uint64_t warmup_phase = phase++;
+                auto warmup_result = warmup_bench.measure_read_count_total(
+                    parsed.prewarm_count,
+                    [&sync, warmup_phase] {
+                        sync.begin_phase(warmup_phase);
+                    });
+                (void)sync.report(
+                    warmup_phase,
+                    static_cast<std::uint64_t>(
+                        run_opts.threads_per_server *
+                        static_cast<int>(run_opts.server_hosts.size())),
+                    warmup_result.bytes,
+                    warmup_result.elapsed_sec);
             }
 
             std::vector<double> trial_gbps_values;
@@ -254,13 +496,27 @@ int main(int argc, char* argv[]) {
 
             for (int trial = 0; trial < run_opts.trials; ++trial) {
                 rdma_read_bench::MultiServerReadBench bench(run_opts);
-                auto result = bench.measure_read_count_total(parsed.count);
-                trial_gbps_values.push_back(
-                    rdma_read_bench::bytes_to_gbps(
-                        result.bytes,
-                        result.elapsed_sec));
+                const std::uint64_t trial_phase = phase++;
+                auto result = bench.measure_read_count_total(
+                    parsed.count,
+                    [&sync, trial_phase] {
+                        sync.begin_phase(trial_phase);
+                    });
+                auto gbps = sync.report(
+                    trial_phase,
+                    static_cast<std::uint64_t>(
+                        run_opts.threads_per_server *
+                        static_cast<int>(run_opts.server_hosts.size())),
+                    result.bytes,
+                    result.elapsed_sec);
+                if (gbps.has_value()) {
+                    trial_gbps_values.push_back(*gbps);
+                }
             }
 
+            if (!sync.should_print()) {
+                continue;
+            }
             const int total_threads =
                 run_opts.threads_per_server *
                 static_cast<int>(run_opts.server_hosts.size());

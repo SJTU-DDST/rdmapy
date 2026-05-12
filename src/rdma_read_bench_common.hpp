@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -1021,8 +1022,10 @@ public:
         return results;
     }
 
-    std::vector<ThroughputWorkerResult> measure_read_count(std::uint64_t count) {
-        auto run = measure_read_count_total(count);
+    std::vector<ThroughputWorkerResult> measure_read_count(
+        std::uint64_t count,
+        const std::function<void()>& before_measure = {}) {
+        auto run = measure_read_count_total(count, before_measure);
         std::vector<ThroughputWorkerResult> results(
             static_cast<std::size_t>(total_threads()));
         const int threads = total_threads();
@@ -1040,7 +1043,9 @@ public:
         return results;
     }
 
-    ThroughputRunResult measure_read_count_total(std::uint64_t count) {
+    ThroughputRunResult measure_read_count_total(
+        std::uint64_t count,
+        const std::function<void()>& before_measure = {}) {
         if (count == 0) {
             throw std::runtime_error("read count must be positive");
         }
@@ -1053,7 +1058,10 @@ public:
         std::chrono::steady_clock::time_point run_end;
         std::barrier measure_start_gate(
             static_cast<std::ptrdiff_t>(threads),
-            [&run_start] {
+            [&] {
+                if (before_measure) {
+                    before_measure();
+                }
                 run_start = std::chrono::steady_clock::now();
             });
         std::barrier measure_end_gate(
