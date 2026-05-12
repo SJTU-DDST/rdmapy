@@ -18,6 +18,7 @@ using rdma_read_bench::Options;
 struct ReadBwOptions {
     Options common;
     std::uint64_t count = 3000;
+    std::string trial_reducer = "mean";
 };
 
 void print_usage(const char* prog) {
@@ -47,6 +48,7 @@ void print_usage(const char* prog) {
         << "  --count N                   4MB READs per worker, default: 3000\n"
         << "  --warmup-ops N              warmup READs per worker, default: 8\n"
         << "  --trials N                  default: 1\n"
+        << "  --trial-reducer MODE        mean|median|max, default: mean\n"
         << "  --start-delay-sec SEC       sleep before connecting, default: 0\n"
         << "  --stagger-us N              default: 0\n"
         << "  --cpu-list LIST             pin local workers, e.g. 0,2,4,6\n"
@@ -112,6 +114,9 @@ ReadBwOptions parse_args(int argc, char* argv[]) {
                     rdma_read_bench::take_value(i, argc, argv, arg),
                     1,
                     std::numeric_limits<int>::max()));
+        } else if (arg == "--trial-reducer") {
+            parsed.trial_reducer = rdma_read_bench::lower_copy(
+                rdma_read_bench::take_value(i, argc, argv, arg));
         } else {
             rdma_read_bench::usage_error("unknown argument: " + arg);
         }
@@ -124,7 +129,31 @@ ReadBwOptions parse_args(int argc, char* argv[]) {
             "this read_bw-compatible throughput test is host-memory only; "
             "remove --memory cuda or use --memory host");
     }
+    if (parsed.trial_reducer != "max" &&
+        parsed.trial_reducer != "median" &&
+        parsed.trial_reducer != "mean") {
+        rdma_read_bench::usage_error(
+            "--trial-reducer must be max, median, or mean");
+    }
     return parsed;
+}
+
+double reduce_trials(std::vector<double> values, const std::string& reducer) {
+    if (values.empty()) {
+        return 0.0;
+    }
+    if (reducer == "max") {
+        return *std::max_element(values.begin(), values.end());
+    }
+    if (reducer == "median") {
+        std::sort(values.begin(), values.end());
+        return values[values.size() / 2];
+    }
+    double sum = 0.0;
+    for (double value : values) {
+        sum += value;
+    }
+    return sum / static_cast<double>(values.size());
 }
 
 } // namespace
@@ -151,6 +180,7 @@ int main(int argc, char* argv[]) {
             << " count=" << parsed.count
             << " warmup_ops=" << opts.warmup_ops
             << " trials=" << opts.trials
+            << " trial_reducer=" << parsed.trial_reducer
             << "\n";
         std::cout.flush();
         if (opts.start_delay_sec > 0.0) {
@@ -170,7 +200,8 @@ int main(int argc, char* argv[]) {
             run_opts.pipeline_depth = 1;
             run_opts.reuse_local_buffer = true;
 
-            double accumulated_gbps = 0.0;
+            std::vector<double> trial_gbps_values;
+            trial_gbps_values.reserve(static_cast<std::size_t>(run_opts.trials));
 
             for (int trial = 0; trial < run_opts.trials; ++trial) {
                 rdma_read_bench::MultiServerReadBench bench(run_opts);
@@ -182,15 +213,16 @@ int main(int argc, char* argv[]) {
                         result.bytes,
                         result.elapsed_sec);
                 }
-                accumulated_gbps += trial_gbps;
+                trial_gbps_values.push_back(trial_gbps);
             }
 
             const int total_threads =
                 run_opts.threads_per_server *
                 static_cast<int>(run_opts.server_hosts.size());
             std::cout << total_threads << ","
-                      << accumulated_gbps /
-                             static_cast<double>(run_opts.trials)
+                      << reduce_trials(
+                             std::move(trial_gbps_values),
+                             parsed.trial_reducer)
                       << "\n";
             std::cout.flush();
         }
