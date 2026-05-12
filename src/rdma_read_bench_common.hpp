@@ -1037,7 +1037,8 @@ public:
                     }
                     start_gate.arrive_and_wait();
                     auto& worker = workers_[static_cast<std::size_t>(worker_id)];
-                    worker.buffer->activate();
+                    auto local_buffer = make_buffer(opts_);
+                    local_buffer->activate();
                     if (opts_.stagger_us > 0) {
                         std::this_thread::sleep_for(
                             std::chrono::microseconds(
@@ -1045,13 +1046,13 @@ public:
                                 static_cast<std::int64_t>(worker_id)));
                     }
                     for (int i = 0; i < opts_.warmup_ops; ++i) {
-                        read_payload_once(worker);
+                        read_payload_once(worker, *local_buffer);
                     }
 
                     measure_gate.arrive_and_wait();
                     const auto start = std::chrono::steady_clock::now();
                     for (std::uint64_t i = 0; i < count; ++i) {
-                        read_payload_once(worker);
+                        read_payload_once(worker, *local_buffer);
                     }
                     const auto end = std::chrono::steady_clock::now();
 
@@ -1175,24 +1176,28 @@ private:
     }
 
     double read_payload_once(WorkerState& worker) const {
+        return read_payload_once(worker, *worker.buffer);
+    }
+
+    double read_payload_once(WorkerState& worker, LocalBuffer& buffer) const {
         if (opts_.completion_mode == "raw-poll") {
             return worker.session->read_into_transfer_latency_us_raw_poll(
                 worker.base_offset,
-                worker.buffer->addr(),
+                buffer.addr(),
                 opts_.payload_bytes,
                 opts_.payload_bytes,
                 nullptr,
-                worker.buffer->length(),
+                buffer.length(),
                 1,
                 opts_.debug);
         }
         return worker.session->read_into_transfer_latency_us(
             worker.base_offset,
-            worker.buffer->addr(),
+            buffer.addr(),
             opts_.payload_bytes,
             opts_.payload_bytes,
             nullptr,
-            worker.buffer->length(),
+            buffer.length(),
             1,
             opts_.debug);
     }
