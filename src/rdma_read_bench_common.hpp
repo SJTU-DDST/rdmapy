@@ -104,6 +104,8 @@ struct ThroughputRunResult {
     std::uint64_t ops = 0;
     std::uint64_t bytes = 0;
     double elapsed_sec = 0.0;
+    std::vector<std::uint64_t> per_server_bytes;
+    std::vector<double> per_server_elapsed_sec;
 };
 
 struct WorkerMapRow {
@@ -1078,6 +1080,17 @@ public:
         const auto active_workers =
             active_worker_indices(active_threads_per_server);
         const int threads = static_cast<int>(active_workers.size());
+        std::vector<std::uint64_t> per_server_bytes(
+            static_cast<std::size_t>(num_servers()),
+            0);
+        std::vector<std::chrono::steady_clock::time_point> per_server_end(
+            static_cast<std::size_t>(num_servers()));
+        std::mutex per_server_end_mutex;
+        for (int worker_id : active_workers) {
+            const auto& worker = workers_[static_cast<std::size_t>(worker_id)];
+            per_server_bytes[static_cast<std::size_t>(worker.server_index)] +=
+                count * opts_.payload_bytes;
+        }
         StartGate start_gate(threads);
         std::vector<std::thread> thread_pool;
         std::mutex exception_mutex;
@@ -1126,6 +1139,17 @@ public:
                     for (std::uint64_t i = 0; i < count; ++i) {
                         read_payload_once(worker, *local_buffer);
                     }
+                    const auto worker_end = std::chrono::steady_clock::now();
+                    {
+                        std::lock_guard<std::mutex> lk(per_server_end_mutex);
+                        auto& server_end =
+                            per_server_end[static_cast<std::size_t>(
+                                worker.server_index)];
+                        if (server_end.time_since_epoch().count() == 0 ||
+                            worker_end > server_end) {
+                            server_end = worker_end;
+                        }
+                    }
                     measure_end_gate.arrive_and_wait();
                     if (send_done && opts_.completion_mode == "raw-poll") {
                         try {
@@ -1155,10 +1179,24 @@ public:
 
         const double elapsed_sec =
             std::chrono::duration<double>(run_end - run_start).count();
+        std::vector<double> per_server_elapsed_sec(per_server_end.size(), 0.0);
+        for (std::size_t server_index = 0;
+             server_index < per_server_end.size();
+             ++server_index) {
+            if (per_server_bytes[server_index] == 0 ||
+                per_server_end[server_index].time_since_epoch().count() == 0) {
+                continue;
+            }
+            per_server_elapsed_sec[server_index] =
+                std::chrono::duration<double>(
+                    per_server_end[server_index] - run_start).count();
+        }
         return ThroughputRunResult{
             count * static_cast<std::uint64_t>(threads),
             count * opts_.payload_bytes * static_cast<std::uint64_t>(threads),
-            elapsed_sec};
+            elapsed_sec,
+            std::move(per_server_bytes),
+            std::move(per_server_elapsed_sec)};
     }
 
     void close_raw_poll_sessions() {

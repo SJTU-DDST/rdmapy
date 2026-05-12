@@ -50,6 +50,7 @@ struct ReadBwOptions {
     std::uint16_t sync_port = 2444;
     int sync_clients = 2;
     std::string sync_output = "local";
+    bool server_breakdown = false;
 };
 
 class CrossClientSync {
@@ -247,7 +248,8 @@ void print_usage(const char* prog) {
         << "  --sync-host HOST                sync server host for client role\n"
         << "  --sync-port PORT                default: 2444\n"
         << "  --sync-clients N                default: 2\n"
-        << "  --sync-output local|aggregate|none  default: local\n";
+        << "  --sync-output local|aggregate|none  default: local\n"
+        << "  --server-breakdown              print local per-server bandwidth columns\n";
 }
 
 ReadBwOptions parse_args(int argc, char* argv[]) {
@@ -348,6 +350,8 @@ ReadBwOptions parse_args(int argc, char* argv[]) {
         } else if (arg == "--sync-output") {
             parsed.sync_output = rdma_read_bench::lower_copy(
                 rdma_read_bench::take_value(i, argc, argv, arg));
+        } else if (arg == "--server-breakdown") {
+            parsed.server_breakdown = true;
         } else {
             rdma_read_bench::usage_error("unknown argument: " + arg);
         }
@@ -452,6 +456,9 @@ int main(int argc, char* argv[]) {
                 << " trial_reducer=" << parsed.trial_reducer
                 << " persistent_qps=true"
                 << " shared_device_pd=true"
+                << " server_breakdown="
+                << (parsed.server_breakdown ? "true" : "false")
+                << " server_breakdown_time=per_server_last_worker"
                 << " sync_role=" << parsed.sync_role
                 << " sync_output=" << parsed.sync_output
                 << "\n";
@@ -462,7 +469,17 @@ int main(int argc, char* argv[]) {
                 std::chrono::duration<double>(opts.start_delay_sec));
         }
         if (sync.should_print()) {
-            std::cout << "threads,gbps\n";
+            if (parsed.server_breakdown) {
+                std::cout << "threads,total_gbps";
+                for (std::size_t server_index = 0;
+                     server_index < opts.server_hosts.size();
+                     ++server_index) {
+                    std::cout << ",server" << server_index << "_gbps";
+                }
+                std::cout << "\n";
+            } else {
+                std::cout << "threads,gbps\n";
+            }
         }
         std::uint64_t phase = 0;
         rdma_read_bench::MultiServerReadBench bench(opts);
@@ -492,6 +509,11 @@ int main(int argc, char* argv[]) {
 
             std::vector<double> trial_gbps_values;
             trial_gbps_values.reserve(static_cast<std::size_t>(opts.trials));
+            std::vector<std::vector<double>> trial_server_gbps_values(
+                opts.server_hosts.size());
+            for (auto& values : trial_server_gbps_values) {
+                values.reserve(static_cast<std::size_t>(opts.trials));
+            }
 
             for (int trial = 0; trial < opts.trials; ++trial) {
                 const std::uint64_t trial_phase = phase++;
@@ -510,6 +532,16 @@ int main(int argc, char* argv[]) {
                 if (gbps.has_value()) {
                     trial_gbps_values.push_back(*gbps);
                 }
+                if (gbps.has_value() && parsed.server_breakdown) {
+                    for (std::size_t server_index = 0;
+                         server_index < result.per_server_bytes.size();
+                         ++server_index) {
+                        trial_server_gbps_values[server_index].push_back(
+                            rdma_read_bench::bytes_to_gbps(
+                                result.per_server_bytes[server_index],
+                                result.per_server_elapsed_sec[server_index]));
+                    }
+                }
             }
 
             if (!sync.should_print()) {
@@ -518,8 +550,16 @@ int main(int argc, char* argv[]) {
             std::cout << total_threads << ","
                       << reduce_trials(
                              std::move(trial_gbps_values),
-                             parsed.trial_reducer)
-                      << "\n";
+                             parsed.trial_reducer);
+            if (parsed.server_breakdown) {
+                for (auto& values : trial_server_gbps_values) {
+                    std::cout << ","
+                              << reduce_trials(
+                                     std::move(values),
+                                     parsed.trial_reducer);
+                }
+            }
+            std::cout << "\n";
             std::cout.flush();
         }
         bench.close_raw_poll_sessions();
