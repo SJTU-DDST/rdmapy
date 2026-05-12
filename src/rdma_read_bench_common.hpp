@@ -57,6 +57,7 @@ struct Options {
     std::vector<int> ib_devices;
     int client_id = 0;
     int clients = 1;
+    int min_threads_per_server = 1;
     int threads_per_server = 16;
     int cuda_device = 0;
     std::string memory = kDefaultMemory;
@@ -426,6 +427,12 @@ inline void finalize_options(Options& opts,
     if (opts.threads_per_server < 1) {
         usage_error("--threads-per-server must be positive");
     }
+    if (opts.min_threads_per_server < 1) {
+        usage_error("--min-threads must be positive");
+    }
+    if (opts.min_threads_per_server > opts.threads_per_server) {
+        usage_error("--min-threads must be <= --max-threads/--threads-per-server");
+    }
     if (opts.repeats < 1) {
         usage_error("--repeats must be positive");
     }
@@ -499,7 +506,14 @@ inline void parse_common_arg(Options& opts,
         opts.clients = static_cast<int>(
             parse_ll(arg, take_value(i, argc, argv, arg), 1,
                      std::numeric_limits<int>::max()));
-    } else if (arg == "--threads-per-server") {
+    } else if (arg == "--min-threads" ||
+               arg == "--min-threads-per-server") {
+        opts.min_threads_per_server = static_cast<int>(
+            parse_ll(arg, take_value(i, argc, argv, arg), 1,
+                     std::numeric_limits<int>::max()));
+    } else if (arg == "--max-threads" ||
+               arg == "--max-threads-per-server" ||
+               arg == "--threads-per-server") {
         opts.threads_per_server = static_cast<int>(
             parse_ll(arg, take_value(i, argc, argv, arg), 1,
                      std::numeric_limits<int>::max()));

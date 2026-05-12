@@ -25,7 +25,9 @@ void print_usage(const char* prog) {
         << "  --port PORT                 default: 2333\n"
         << "  --clients N                 metadata for 2-client runs, default: 1\n"
         << "  --client-id ID              metadata/offset partition, default: 0\n"
-        << "  --threads-per-server N      default: 16\n"
+        << "  --min-threads N             per-server min, default: 1\n"
+        << "  --max-threads N             per-server max, default: 16\n"
+        << "  --threads-per-server N      alias for --max-threads\n"
         << "  --ib-devices LIST           local RDMA device list, e.g. 0,1\n"
         << "  --ib-ports LIST             local RDMA port list, e.g. 1,1\n"
         << "  --ib-device DEV             default: 0\n"
@@ -148,8 +150,9 @@ int main(int argc, char* argv[]) {
             << " clients=" << opts.clients
             << " client_id=" << opts.client_id
             << " servers=" << opts.server_hosts.size()
-            << " threads_per_server=" << opts.threads_per_server
-            << " total_local_threads="
+            << " min_threads_per_server=" << opts.min_threads_per_server
+            << " max_threads_per_server=" << opts.threads_per_server
+            << " max_total_local_threads="
             << opts.threads_per_server *
                    static_cast<int>(opts.server_hosts.size())
             << " payload_bytes=" << opts.payload_bytes
@@ -166,55 +169,68 @@ int main(int argc, char* argv[]) {
             << "section,client_id,clients,servers,server_idx,endpoint,"
             << "threads,payload_bytes,seconds,ops,bytes,gbps,gibps,mops\n";
 
-        std::vector<std::uint64_t> per_server_ops(opts.server_hosts.size(), 0);
-        std::vector<std::uint64_t> per_server_bytes(opts.server_hosts.size(), 0);
-        double accumulated_seconds = 0.0;
-        std::uint64_t total_ops = 0;
-        std::uint64_t total_bytes = 0;
+        for (int threads_per_server = opts.min_threads_per_server;
+             threads_per_server <= opts.threads_per_server;
+             ++threads_per_server) {
+            Options run_opts = opts;
+            run_opts.threads_per_server = threads_per_server;
 
-        for (int trial = 0; trial < opts.trials; ++trial) {
-            rdma_read_bench::MultiServerReadBench bench(opts);
-            auto results = bench.measure_throughput();
+            std::vector<std::uint64_t> per_server_ops(
+                run_opts.server_hosts.size(), 0);
+            std::vector<std::uint64_t> per_server_bytes(
+                run_opts.server_hosts.size(), 0);
+            double accumulated_seconds = 0.0;
+            std::uint64_t total_ops = 0;
+            std::uint64_t total_bytes = 0;
 
-            double trial_seconds = 0.0;
-            for (const auto& result : results) {
-                trial_seconds = std::max(trial_seconds, result.elapsed_sec);
+            for (int trial = 0; trial < run_opts.trials; ++trial) {
+                rdma_read_bench::MultiServerReadBench bench(run_opts);
+                auto results = bench.measure_throughput();
+
+                double trial_seconds = 0.0;
+                for (const auto& result : results) {
+                    trial_seconds = std::max(
+                        trial_seconds, result.elapsed_sec);
+                }
+                accumulated_seconds += trial_seconds;
+
+                for (const auto& result : results) {
+                    total_ops += result.ops;
+                    total_bytes += result.bytes;
+                    per_server_ops[
+                        static_cast<std::size_t>(result.server_index)] +=
+                        result.ops;
+                    per_server_bytes[
+                        static_cast<std::size_t>(result.server_index)] +=
+                        result.bytes;
+                }
             }
-            accumulated_seconds += trial_seconds;
 
-            for (const auto& result : results) {
-                total_ops += result.ops;
-                total_bytes += result.bytes;
-                per_server_ops[static_cast<std::size_t>(result.server_index)] +=
-                    result.ops;
-                per_server_bytes[static_cast<std::size_t>(result.server_index)] +=
-                    result.bytes;
-            }
-        }
-
-        print_throughput_row(
-            opts,
-            "overall",
-            -1,
-            "all",
-            opts.threads_per_server *
-                static_cast<int>(opts.server_hosts.size()),
-            total_ops,
-            total_bytes,
-            accumulated_seconds);
-
-        for (int server_index = 0;
-             server_index < static_cast<int>(opts.server_hosts.size());
-             ++server_index) {
             print_throughput_row(
-                opts,
-                "server",
-                server_index,
-                rdma_read_bench::endpoint_label(opts, server_index),
-                opts.threads_per_server,
-                per_server_ops[static_cast<std::size_t>(server_index)],
-                per_server_bytes[static_cast<std::size_t>(server_index)],
+                run_opts,
+                "overall",
+                -1,
+                "all",
+                run_opts.threads_per_server *
+                    static_cast<int>(run_opts.server_hosts.size()),
+                total_ops,
+                total_bytes,
                 accumulated_seconds);
+
+            for (int server_index = 0;
+                 server_index <
+                     static_cast<int>(run_opts.server_hosts.size());
+                 ++server_index) {
+                print_throughput_row(
+                    run_opts,
+                    "server",
+                    server_index,
+                    rdma_read_bench::endpoint_label(run_opts, server_index),
+                    run_opts.threads_per_server,
+                    per_server_ops[static_cast<std::size_t>(server_index)],
+                    per_server_bytes[static_cast<std::size_t>(server_index)],
+                    accumulated_seconds);
+            }
         }
         return 0;
     } catch (const std::exception& e) {
