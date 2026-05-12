@@ -450,6 +450,8 @@ int main(int argc, char* argv[]) {
                 << " warmup_ops=" << opts.warmup_ops
                 << " trials=" << opts.trials
                 << " trial_reducer=" << parsed.trial_reducer
+                << " persistent_qps=true"
+                << " shared_device_pd=true"
                 << " sync_role=" << parsed.sync_role
                 << " sync_output=" << parsed.sync_output
                 << "\n";
@@ -463,50 +465,46 @@ int main(int argc, char* argv[]) {
             std::cout << "threads,gbps\n";
         }
         std::uint64_t phase = 0;
+        rdma_read_bench::MultiServerReadBench bench(opts);
 
         for (int threads_per_server = opts.min_threads_per_server;
              threads_per_server <= opts.threads_per_server;
              ++threads_per_server) {
-            Options run_opts = opts;
-            run_opts.threads_per_server = threads_per_server;
-            run_opts.chunk_bytes = run_opts.payload_bytes;
-            run_opts.max_inflight = 1;
-            run_opts.pipeline_depth = 1;
-            run_opts.reuse_local_buffer = true;
+            const int total_threads =
+                threads_per_server *
+                static_cast<int>(opts.server_hosts.size());
 
             if (parsed.prewarm_count > 0) {
-                rdma_read_bench::MultiServerReadBench warmup_bench(run_opts);
                 const std::uint64_t warmup_phase = phase++;
-                auto warmup_result = warmup_bench.measure_read_count_total(
+                auto warmup_result = bench.measure_read_count_total(
                     parsed.prewarm_count,
                     [&sync, warmup_phase] {
                         sync.begin_phase(warmup_phase);
-                    });
+                    },
+                    threads_per_server,
+                    false);
                 (void)sync.report(
                     warmup_phase,
-                    static_cast<std::uint64_t>(
-                        run_opts.threads_per_server *
-                        static_cast<int>(run_opts.server_hosts.size())),
+                    static_cast<std::uint64_t>(total_threads),
                     warmup_result.bytes,
                     warmup_result.elapsed_sec);
             }
 
             std::vector<double> trial_gbps_values;
-            trial_gbps_values.reserve(static_cast<std::size_t>(run_opts.trials));
+            trial_gbps_values.reserve(static_cast<std::size_t>(opts.trials));
 
-            for (int trial = 0; trial < run_opts.trials; ++trial) {
-                rdma_read_bench::MultiServerReadBench bench(run_opts);
+            for (int trial = 0; trial < opts.trials; ++trial) {
                 const std::uint64_t trial_phase = phase++;
                 auto result = bench.measure_read_count_total(
                     parsed.count,
                     [&sync, trial_phase] {
                         sync.begin_phase(trial_phase);
-                    });
+                    },
+                    threads_per_server,
+                    false);
                 auto gbps = sync.report(
                     trial_phase,
-                    static_cast<std::uint64_t>(
-                        run_opts.threads_per_server *
-                        static_cast<int>(run_opts.server_hosts.size())),
+                    static_cast<std::uint64_t>(total_threads),
                     result.bytes,
                     result.elapsed_sec);
                 if (gbps.has_value()) {
@@ -517,9 +515,6 @@ int main(int argc, char* argv[]) {
             if (!sync.should_print()) {
                 continue;
             }
-            const int total_threads =
-                run_opts.threads_per_server *
-                static_cast<int>(run_opts.server_hosts.size());
             std::cout << total_threads << ","
                       << reduce_trials(
                              std::move(trial_gbps_values),
@@ -527,6 +522,7 @@ int main(int argc, char* argv[]) {
                       << "\n";
             std::cout.flush();
         }
+        bench.close_raw_poll_sessions();
         return 0;
     } catch (const std::exception& e) {
         std::cerr << "rdma_read_matrix_throughput failed: "

@@ -1326,12 +1326,23 @@ public:
     explicit RdmaEndpoint(int ib_port = 1,
                           int device_num = 1,
                           uint32_t io_workers = 1,
-                          size_t cq_batch_size = 16) {
+                          size_t cq_batch_size = 16,
+                          std::shared_ptr<rdmapp::device> shared_device = nullptr,
+                          std::shared_ptr<rdmapp::pd> shared_pd = nullptr) {
         io_workers = std::max<uint32_t>(io_workers, 1);
         cq_batch_size = std::max<size_t>(cq_batch_size, 1);
 
-        device_ = std::make_shared<rdmapp::device>(device_num, ib_port);
-        pd_     = std::make_shared<rdmapp::pd>(device_);
+        if ((shared_device == nullptr) != (shared_pd == nullptr)) {
+            throw std::runtime_error(
+                "shared RDMA device and PD must be provided together");
+        }
+        if (shared_device != nullptr) {
+            device_ = std::move(shared_device);
+            pd_ = std::move(shared_pd);
+        } else {
+            device_ = std::make_shared<rdmapp::device>(device_num, ib_port);
+            pd_ = std::make_shared<rdmapp::pd>(device_);
+        }
         cq_     = std::make_shared<rdmapp::cq>(device_);
 
         io_ctx_   = std::make_shared<asio::io_context>(io_workers);

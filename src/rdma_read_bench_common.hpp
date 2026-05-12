@@ -800,6 +800,11 @@ struct WorkerState {
     std::uint64_t base_offset = 0;
 };
 
+struct EndpointSharedResource {
+    std::shared_ptr<rdmapp::device> device;
+    std::shared_ptr<rdmapp::pd> pd;
+};
+
 inline double mean(const std::vector<double>& values) {
     if (values.empty()) {
         return 0.0;
@@ -828,6 +833,17 @@ public:
             pin_current_thread_to_cpu(opts_.cpu_list.front());
         }
         const int total_workers = total_threads();
+        const std::size_t configs = endpoint_config_count(opts_);
+        shared_resources_.reserve(configs);
+        for (std::size_t config_id = 0; config_id < configs; ++config_id) {
+            const int ib_device = pick_round_robin(opts_.ib_devices, config_id);
+            const int ib_port = pick_round_robin(opts_.ib_ports, config_id);
+            auto device = std::make_shared<rdmapp::device>(ib_device, ib_port);
+            auto pd = std::make_shared<rdmapp::pd>(device);
+            shared_resources_.push_back(
+                EndpointSharedResource{std::move(device), std::move(pd)});
+        }
+
         endpoints_.reserve(static_cast<std::size_t>(total_workers));
         workers_.reserve(static_cast<std::size_t>(total_workers));
         for (int server_index = 0; server_index < num_servers(); ++server_index) {
@@ -1045,11 +1061,23 @@ public:
 
     ThroughputRunResult measure_read_count_total(
         std::uint64_t count,
-        const std::function<void()>& before_measure = {}) {
+        const std::function<void()>& before_measure = {},
+        int active_threads_per_server = 0,
+        bool send_done = true) {
         if (count == 0) {
             throw std::runtime_error("read count must be positive");
         }
-        const int threads = total_threads();
+        if (active_threads_per_server == 0) {
+            active_threads_per_server = opts_.threads_per_server;
+        }
+        if (active_threads_per_server < 1 ||
+            active_threads_per_server > opts_.threads_per_server) {
+            throw std::runtime_error(
+                "active_threads_per_server is outside the configured range");
+        }
+        const auto active_workers =
+            active_worker_indices(active_threads_per_server);
+        const int threads = static_cast<int>(active_workers.size());
         StartGate start_gate(threads);
         std::vector<std::thread> thread_pool;
         std::mutex exception_mutex;
@@ -1071,9 +1099,11 @@ public:
             });
         thread_pool.reserve(static_cast<std::size_t>(threads));
 
-        for (int worker_id = 0; worker_id < threads; ++worker_id) {
-            thread_pool.emplace_back([&, worker_id] {
+        for (int active_id = 0; active_id < threads; ++active_id) {
+            thread_pool.emplace_back([&, active_id] {
                 try {
+                    const int worker_id =
+                        active_workers[static_cast<std::size_t>(active_id)];
                     if (!opts_.cpu_list.empty()) {
                         pin_current_thread_to_cpu(
                             opts_.cpu_list[static_cast<std::size_t>(worker_id)]);
@@ -1097,8 +1127,15 @@ public:
                         read_payload_once(worker, *local_buffer);
                     }
                     measure_end_gate.arrive_and_wait();
-                    if (opts_.completion_mode == "raw-poll") {
-                        worker.session->send_done_raw_poll();
+                    if (send_done && opts_.completion_mode == "raw-poll") {
+                        try {
+                            worker.session->send_done_raw_poll();
+                        } catch (const std::exception& e) {
+                            spdlog::debug(
+                                "best-effort done send failed after measured "
+                                "READs: {}",
+                                e.what());
+                        }
                     }
                 } catch (...) {
                     std::lock_guard<std::mutex> lk(exception_mutex);
@@ -1124,17 +1161,51 @@ public:
             elapsed_sec};
     }
 
+    void close_raw_poll_sessions() {
+        if (opts_.completion_mode != "raw-poll") {
+            return;
+        }
+        for (auto& worker : workers_) {
+            try {
+                worker.session->send_done_raw_poll();
+            } catch (const std::exception& e) {
+                spdlog::debug(
+                    "best-effort final done send failed after throughput "
+                    "sweep: {}",
+                    e.what());
+            }
+        }
+    }
+
 private:
+    std::vector<int> active_worker_indices(int active_threads_per_server) const {
+        std::vector<int> indices;
+        indices.reserve(
+            static_cast<std::size_t>(num_servers() * active_threads_per_server));
+        for (int server_index = 0; server_index < num_servers(); ++server_index) {
+            const int server_base = server_index * opts_.threads_per_server;
+            for (int local_worker = 0;
+                 local_worker < active_threads_per_server;
+                 ++local_worker) {
+                indices.push_back(server_base + local_worker);
+            }
+        }
+        return indices;
+    }
+
     std::unique_ptr<RdmaEndpoint> make_endpoint(int server_index) const {
         const std::size_t config_id =
             static_cast<std::size_t>(server_index) % endpoint_config_count(opts_);
         int ib_device = pick_round_robin(opts_.ib_devices, config_id);
         int ib_port = pick_round_robin(opts_.ib_ports, config_id);
+        const auto& resource = shared_resources_[config_id];
         return std::make_unique<RdmaEndpoint>(
             ib_port,
             ib_device,
             static_cast<std::uint32_t>(opts_.io_workers),
-            opts_.cq_batch_size);
+            opts_.cq_batch_size,
+            resource.device,
+            resource.pd);
     }
 
     void add_worker(int server_index,
@@ -1251,6 +1322,7 @@ private:
     }
 
     const Options& opts_;
+    std::vector<EndpointSharedResource> shared_resources_;
     std::vector<std::unique_ptr<RdmaEndpoint>> endpoints_;
     std::vector<WorkerState> workers_;
 };
