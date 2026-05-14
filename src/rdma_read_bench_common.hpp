@@ -1419,11 +1419,11 @@ private:
             opts_.debug);
     }
 
-    double read_payload_once(WorkerState& worker) const {
+    double read_payload_once(const WorkerState& worker) const {
         return read_payload_once(worker, *worker.buffer);
     }
 
-    double read_payload_once(WorkerState& worker, LocalBuffer& buffer) const {
+    double read_payload_once(const WorkerState& worker, LocalBuffer& buffer) const {
         if (opts_.completion_mode == "raw-poll") {
             return worker.session->read_into_transfer_latency_us_raw_poll(
                 worker.base_offset,
