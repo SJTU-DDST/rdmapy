@@ -50,6 +50,8 @@ find_package(pybind11 2.13 CONFIG REQUIRED)
 pybind11_add_module(rdma_py
     src/binding.cpp
     src/rdma_session.hpp            # header-only不会编译，但可以写进去无所谓
+    src/promptdb_lsh.hpp
+    src/promptdb_client.hpp
 )
 
 target_compile_features(rdma_py PRIVATE cxx_std_20)

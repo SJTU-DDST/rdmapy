@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -14,6 +15,7 @@
 #include <spdlog/spdlog.h>
 
 #include "rdma_session.hpp"
+#include "promptdb_client.hpp"
 
 namespace py = pybind11;
 
@@ -313,4 +315,54 @@ PYBIND11_MODULE(rdma_py, m) {
              &RdmaEndpoint::connect,
              py::arg("host"),
              py::arg("port"));
+
+    py::class_<promptdb_rdma::PromptDbRdmaClient>(m, "PromptDbClient")
+        .def(py::init<std::string,
+                      std::uint16_t,
+                      std::uint32_t,
+                      int,
+                      int,
+                      int,
+                      std::size_t>(),
+             py::arg("host"),
+             py::arg("port"),
+             py::arg("max_tokens"),
+             py::arg("ib_device") = 1,
+             py::arg("ib_port") = 1,
+             py::arg("io_workers") = 1,
+             py::arg("cq_batch_size") = 16)
+        .def("add_prompt",
+             [](promptdb_rdma::PromptDbRdmaClient& client,
+                int idx,
+                const std::vector<std::uint32_t>& tokens) -> py::object {
+                 std::optional<int> evicted;
+                 {
+                     py::gil_scoped_release release;
+                     evicted = client.add_prompt(idx, tokens);
+                 }
+                 if (evicted.has_value()) {
+                     return py::cast(*evicted);
+                 }
+                 return py::none();
+             },
+             py::arg("idx"),
+             py::arg("tokens"))
+        .def("find_most_similar_prompt",
+             [](promptdb_rdma::PromptDbRdmaClient& client,
+                const std::vector<std::uint32_t>& tokens) {
+                 promptdb_rdma::PromptDbClientResult result;
+                 {
+                     py::gil_scoped_release release;
+                     result = client.find_most_similar_prompt(tokens);
+                 }
+                 if (result.best_idx < 0) {
+                     return py::make_tuple(-1, py::none(), -1.0);
+                 }
+                 return py::make_tuple(
+                     result.best_idx,
+                     result.best_tokens,
+                     result.best_score);
+             },
+             py::arg("tokens"))
+        .def("close", &promptdb_rdma::PromptDbRdmaClient::close);
 }

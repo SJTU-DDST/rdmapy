@@ -147,7 +147,7 @@ void print_usage(const char* prog) {
         << "  --ib-device DEV             default: 0\n"
         << "  --ib-port PORT              default: 1\n\n"
         << "Payload options:\n"
-        << "  --payload-bytes BYTES       default: 1k; accepts k/m/g suffix\n"
+        << "  --payload-bytes BYTES       default: 1kB; accepts kB/MB/GB suffix\n"
         << "  --prompt-bytes BYTES        alias for --payload-bytes\n"
         << "  --memory cuda|host          default: "
         << rdma_read_bench::kDefaultMemory << "\n"

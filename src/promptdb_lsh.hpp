@@ -19,7 +19,7 @@
 
 namespace promptdb_rdma {
 
-constexpr std::uint16_t kProtocolVersion = 3;
+constexpr std::uint16_t kProtocolVersion = 4;
 constexpr std::uint32_t kClientHelloMagic = 0x48444250u; // PDBH
 constexpr std::uint32_t kServerHelloMagic = 0x68534450u; // PDSh
 constexpr std::uint32_t kRequestMagic = 0x51424450u;     // PDBQ
@@ -29,6 +29,7 @@ constexpr std::uint32_t kResultMagic = 0x52424450u;      // PDBR
 enum class RequestOp : std::uint16_t {
     query = 1,
     shutdown = 2,
+    add_prompt = 3,
 };
 
 enum class Status : std::uint16_t {
@@ -61,7 +62,7 @@ struct RequestWire {
     std::uint16_t op = static_cast<std::uint16_t>(RequestOp::query);
     std::uint64_t request_id = 0;
     std::uint32_t token_count = 0;
-    std::uint32_t reserved = 0;
+    std::int32_t prompt_idx = -1;
 };
 
 struct AckWire {

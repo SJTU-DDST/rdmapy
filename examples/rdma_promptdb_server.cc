@@ -17,6 +17,9 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <mutex>
+#include <optional>
+#include <shared_mutex>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -56,6 +59,7 @@ struct ServerOptions {
     int num_hash_planes = 16;
     int bucket_size = 8;
     int seed = 42;
+    bool prefill = true;
     std::string rdma_log_level = "warn";
 };
 
@@ -165,7 +169,9 @@ void print_usage(const char* prog) {
         << "  --vocab-size N              default: 32000\n"
         << "  --num-hash-planes N         default: 16 (kept for TCP config compatibility)\n"
         << "  --bucket-size N             default: 8\n"
-        << "  --seed N                    default: 42\n";
+        << "  --seed N                    default: 42\n"
+        << "  --prefill                   prefill deterministic prompts; default\n"
+        << "  --no-prefill                start empty for Sequoia online add_prompt\n";
 }
 
 ServerOptions parse_args(int argc, char* argv[]) {
@@ -228,6 +234,10 @@ ServerOptions parse_args(int argc, char* argv[]) {
             opts.seed = static_cast<int>(
                 parse_ll(arg, take_value(i, argc, argv, arg), 0,
                          std::numeric_limits<int>::max()));
+        } else if (arg == "--prefill") {
+            opts.prefill = true;
+        } else if (arg == "--no-prefill") {
+            opts.prefill = false;
         } else if (arg == "--rdma-log-level") {
             opts.rdma_log_level = take_value(i, argc, argv, arg);
         } else if (!arg.empty() && arg[0] == '-') {
@@ -534,7 +544,8 @@ void post_ack_without_wait(std::shared_ptr<rdmapp::qp> qp,
 }
 
 void handle_client(std::shared_ptr<AcceptedClient> client,
-                   std::shared_ptr<const PromptDbState> db,
+                   std::shared_ptr<PromptDbState> db,
+                   std::shared_ptr<std::shared_mutex> db_mutex,
                    std::shared_ptr<const ServerOptions> opts) {
     auto qp = client->qp;
     ClientHelloWire hello =
@@ -591,7 +602,8 @@ void handle_client(std::shared_ptr<AcceptedClient> client,
         if (req.op == static_cast<std::uint16_t>(RequestOp::shutdown)) {
             return;
         }
-        if (req.op != static_cast<std::uint16_t>(RequestOp::query)) {
+        if (req.op != static_cast<std::uint16_t>(RequestOp::query) &&
+            req.op != static_cast<std::uint16_t>(RequestOp::add_prompt)) {
             const std::size_t slot = ack_slot_id++ % kAckRingSize;
             AckWire& ack = ack_ring[slot];
             ack = AckWire{};
@@ -625,7 +637,33 @@ void handle_client(std::shared_ptr<AcceptedClient> client,
             std::span<const std::uint32_t> tokens(
                 prompt_buffer.data(), req.token_count);
             const auto match_start = std::chrono::steady_clock::now();
-            FindResult result = db->find_most_similar_prompt(tokens);
+            if (req.op == static_cast<std::uint16_t>(RequestOp::add_prompt)) {
+                if (req.prompt_idx < 0) {
+                    throw std::runtime_error("add_prompt requires prompt_idx >= 0");
+                }
+                std::vector<std::uint32_t> owned_tokens(
+                    tokens.begin(), tokens.end());
+                std::optional<int> evicted;
+                {
+                    std::unique_lock<std::shared_mutex> lk(*db_mutex);
+                    evicted = db->add_prompt(
+                        req.prompt_idx,
+                        std::move(owned_tokens));
+                }
+                const auto match_end = std::chrono::steady_clock::now();
+                ack.server_match_us = elapsed_us(match_start, match_end);
+                ack.status = static_cast<std::uint16_t>(Status::ok);
+                ack.result_bytes = 0;
+                ack.best_idx = evicted.value_or(-1);
+                post_ack_without_wait(qp, *ack_mrs[slot]);
+                continue;
+            }
+
+            FindResult result;
+            {
+                std::shared_lock<std::shared_mutex> lk(*db_mutex);
+                result = db->find_most_similar_prompt(tokens);
+            }
             const auto match_end = std::chrono::steady_clock::now();
             ack.server_match_us = elapsed_us(match_start, match_end);
             fill_result_buffer(result_buffer, req.request_id, result);
@@ -660,7 +698,8 @@ void handle_client(std::shared_ptr<AcceptedClient> client,
 
 asio::awaitable<void> server_loop(
     std::shared_ptr<PromptDbAcceptor> acceptor,
-    std::shared_ptr<const PromptDbState> db,
+    std::shared_ptr<PromptDbState> db,
+    std::shared_ptr<std::shared_mutex> db_mutex,
     std::shared_ptr<const ServerOptions> opts) {
     while (true) {
         auto client = co_await acceptor->accept();
@@ -673,9 +712,9 @@ asio::awaitable<void> server_loop(
         }
 
         g_live_connections.fetch_add(1);
-        std::thread([client, db, opts] {
+        std::thread([client, db, db_mutex, opts] {
             try {
-                handle_client(client, db, opts);
+                handle_client(client, db, db_mutex, opts);
             } catch (const std::exception& e) {
                 spdlog::info("client handler ended: {}", e.what());
             }
@@ -700,14 +739,18 @@ int main(int argc, char* argv[]) {
         config.seed = opts->seed;
 
         spdlog::info(
-            "building PromptDB: prompts={} token_len={} vocab={} bucket_size={} seed={}",
+            "building PromptDB: prompts={} token_len={} vocab={} bucket_size={} seed={} prefill={}",
             opts->prompts,
             opts->token_len,
             opts->vocab_size,
             opts->bucket_size,
-            opts->seed);
-        auto db = std::make_shared<const PromptDbState>(
-            promptdb_rdma::make_prefilled_prompt_db(config, opts->token_len));
+            opts->seed,
+            opts->prefill);
+        auto db = std::make_shared<PromptDbState>(
+            opts->prefill
+                ? promptdb_rdma::make_prefilled_prompt_db(config, opts->token_len)
+                : PromptDbState(config));
+        auto db_mutex = std::make_shared<std::shared_mutex>();
         spdlog::info("PromptDB ready: num_prompts={}", db->num_prompts());
 
         auto device = std::make_shared<rdmapp::device>(
@@ -728,7 +771,10 @@ int main(int argc, char* argv[]) {
             opts->io_threads);
 
         auto guard = asio::make_work_guard(*io_ctx);
-        asio::co_spawn(*io_ctx, server_loop(acceptor, db, opts), asio::detached);
+        asio::co_spawn(
+            *io_ctx,
+            server_loop(acceptor, db, db_mutex, opts),
+            asio::detached);
 
         std::vector<std::jthread> workers;
         for (int i = 1; i < opts->io_threads; ++i) {
