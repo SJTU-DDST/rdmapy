@@ -451,6 +451,102 @@ public:
             local_mr);
     }
 
+    struct RawReadHandle {
+        std::shared_ptr<rdmapp::local_mr> local_mr;
+        std::size_t reserved_wrs = 0;
+    };
+
+    RawReadHandle post_read_into_raw_poll(
+                   uint64_t offset,
+                   std::uintptr_t local_addr,
+                   uint64_t length,
+                   uint64_t chunk_bytes = 64ull * 1024 * 1024,
+                   std::shared_ptr<void> owner = nullptr,
+                   uint64_t register_length = 0) {
+        if (length > total_len_ || offset > total_len_ - length) {
+            throw std::runtime_error("post_read_into_raw_poll out of range");
+        }
+        if (length > 0 && local_addr == 0) {
+            throw std::runtime_error("post_read_into_raw_poll got null local address");
+        }
+        if (chunk_bytes == 0) {
+            throw std::runtime_error("post_read_into_raw_poll chunk_bytes must be > 0");
+        }
+        if (length == 0) {
+            return {};
+        }
+        if (register_length == 0) {
+            register_length = length;
+        }
+        if (register_length < length) {
+            throw std::runtime_error(
+                "post_read_into_raw_poll register_length is smaller than length");
+        }
+
+        std::shared_ptr<rdmapp::local_mr> local_mr;
+        {
+            std::lock_guard<std::mutex> lk(mutex_);
+            local_mr = get_cached_local_mr(
+                local_addr, register_length, std::move(owner));
+        }
+
+        const remote_mr_info* single_region =
+            length <= chunk_bytes ? find_region_for_range(offset, length) : nullptr;
+        if (single_region == nullptr ||
+            length > std::numeric_limits<uint32_t>::max()) {
+            throw std::runtime_error(
+                "raw-poll post path supports one in-region RDMA READ only");
+        }
+
+        reserve_send_wrs(1);
+        try {
+            struct ibv_sge sge = {};
+            sge.addr = static_cast<uint64_t>(local_addr);
+            sge.length = static_cast<uint32_t>(length);
+            sge.lkey = local_mr->lkey();
+
+            struct ibv_send_wr send_wr = {};
+            struct ibv_send_wr *bad_send_wr = nullptr;
+            send_wr.opcode = IBV_WR_RDMA_READ;
+            send_wr.next = nullptr;
+            send_wr.num_sge = 1;
+            send_wr.sg_list = &sge;
+            send_wr.wr_id = 1;
+            send_wr.send_flags = IBV_SEND_SIGNALED;
+            send_wr.wr.rdma.remote_addr =
+                static_cast<uint64_t>(
+                    single_region->addr + (offset - single_region->prefix_len));
+            send_wr.wr.rdma.rkey = single_region->rkey;
+
+            qp_->post_send(send_wr, bad_send_wr);
+        } catch (...) {
+            release_send_wrs(1);
+            throw;
+        }
+
+        return RawReadHandle{std::move(local_mr), 1};
+    }
+
+    void poll_raw_read_completion(RawReadHandle& handle) {
+        if (handle.reserved_wrs == 0) {
+            return;
+        }
+
+        struct ibv_wc wc = {};
+        while (!qp_->poll_send_cq(wc)) {
+        }
+        const std::size_t reserved_wrs = handle.reserved_wrs;
+        handle.reserved_wrs = 0;
+        handle.local_mr.reset();
+        release_send_wrs(reserved_wrs);
+
+        if (wc.status != IBV_WC_SUCCESS) {
+            throw std::runtime_error(
+                std::string("raw-poll posted RDMA failed: ") +
+                ibv_wc_status_str(wc.status));
+        }
+    }
+
     double read_into_transfer_latency_us_raw_poll_windowed(
                    uint64_t offset,
                    std::uintptr_t local_addr,

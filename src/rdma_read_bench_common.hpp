@@ -923,11 +923,31 @@ public:
         return rows;
     }
 
-    std::vector<LatencySample> measure_latency() {
+    std::vector<LatencySample> measure_latency(
+        const std::function<void()>& before_measure = {}) {
         const int threads = total_threads();
         std::vector<std::vector<LatencySample>> per_worker(
             static_cast<std::size_t>(threads));
         StartGate start_gate(threads);
+        std::exception_ptr before_measure_exception;
+        std::mutex before_measure_exception_mutex;
+        std::barrier measure_start_gate(
+            static_cast<std::ptrdiff_t>(threads),
+            [&] {
+                if (!before_measure) {
+                    return;
+                }
+                try {
+                    before_measure();
+                } catch (...) {
+                    std::lock_guard<std::mutex> lk(
+                        before_measure_exception_mutex);
+                    if (!before_measure_exception) {
+                        before_measure_exception =
+                            std::current_exception();
+                    }
+                }
+            });
         ReusableGate round_gate(threads);
         std::vector<std::thread> thread_pool;
         std::mutex exception_mutex;
@@ -949,6 +969,11 @@ public:
                             std::chrono::microseconds(
                                 opts_.stagger_us *
                                 static_cast<std::int64_t>(worker_id)));
+                    }
+
+                    measure_start_gate.arrive_and_wait();
+                    if (before_measure_exception) {
+                        std::rethrow_exception(before_measure_exception);
                     }
 
                     const int total_iters = opts_.warmup + opts_.repeats;
@@ -1174,22 +1199,12 @@ public:
                                 static_cast<std::int64_t>(first_worker_id)));
                     }
                     for (int i = 0; i < opts_.warmup_ops; ++i) {
-                        for (std::size_t qp = 0; qp < worker_ids.size(); ++qp) {
-                            auto& worker =
-                                workers_[static_cast<std::size_t>(
-                                    worker_ids[qp])];
-                            read_payload_once(worker, *local_buffers[qp]);
-                        }
+                        read_payload_group_once(worker_ids, local_buffers);
                     }
 
                     measure_start_gate.arrive_and_wait();
                     for (std::uint64_t i = 0; i < count; ++i) {
-                        for (std::size_t qp = 0; qp < worker_ids.size(); ++qp) {
-                            auto& worker =
-                                workers_[static_cast<std::size_t>(
-                                    worker_ids[qp])];
-                            read_payload_once(worker, *local_buffers[qp]);
-                        }
+                        read_payload_group_once(worker_ids, local_buffers);
                     }
                     const auto worker_end = std::chrono::steady_clock::now();
                     {
@@ -1429,6 +1444,53 @@ private:
             buffer.length(),
             1,
             opts_.debug);
+    }
+
+    void read_payload_group_once(
+        const std::vector<int>& worker_ids,
+        std::vector<std::unique_ptr<LocalBuffer>>& buffers) const {
+        if (worker_ids.size() == 1 || opts_.completion_mode != "raw-poll") {
+            for (std::size_t qp = 0; qp < worker_ids.size(); ++qp) {
+                auto& worker =
+                    workers_[static_cast<std::size_t>(worker_ids[qp])];
+                read_payload_once(worker, *buffers[qp]);
+            }
+            return;
+        }
+
+        std::vector<RdmaSession::RawReadHandle> handles;
+        handles.reserve(worker_ids.size());
+        try {
+            for (std::size_t qp = 0; qp < worker_ids.size(); ++qp) {
+                auto& worker =
+                    workers_[static_cast<std::size_t>(worker_ids[qp])];
+                handles.push_back(worker.session->post_read_into_raw_poll(
+                    worker.base_offset,
+                    buffers[qp]->addr(),
+                    opts_.payload_bytes,
+                    opts_.payload_bytes,
+                    nullptr,
+                    buffers[qp]->length()));
+            }
+            for (std::size_t qp = 0; qp < worker_ids.size(); ++qp) {
+                auto& worker =
+                    workers_[static_cast<std::size_t>(worker_ids[qp])];
+                worker.session->poll_raw_read_completion(handles[qp]);
+            }
+        } catch (...) {
+            for (std::size_t qp = 0; qp < handles.size(); ++qp) {
+                if (handles[qp].reserved_wrs == 0) {
+                    continue;
+                }
+                try {
+                    auto& worker =
+                        workers_[static_cast<std::size_t>(worker_ids[qp])];
+                    worker.session->poll_raw_read_completion(handles[qp]);
+                } catch (...) {
+                }
+            }
+            throw;
+        }
     }
 
     void stop_background_workers() {
